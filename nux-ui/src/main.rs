@@ -2,6 +2,7 @@
 
 mod display;
 mod overlay;
+pub mod scrcpy;
 mod settings;
 mod state;
 mod toolbar;

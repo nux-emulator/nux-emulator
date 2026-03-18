@@ -33,7 +33,7 @@ pub struct NuxWindow {
     pub sidebar: gtk::Box,
     pub keymap_overlay_widget: gtk::Box,
     pub drop_overlay: gtk::Box,
-    pub display_box: gtk::Box,
+    pub display_widget: gtk::Picture,
     pub state: Rc<UiState>,
 }
 
@@ -70,13 +70,13 @@ impl NuxWindow {
         header_bar.pack_end(&fps_label);
 
         // ── Display area ─────────────────────────────────────────
-        let display_box = display::build_display();
+        let display_widget = display::build_display();
         let keymap_overlay_widget = overlay::build_keymap_overlay();
 
         let display_overlay = gtk::Overlay::builder()
             .hexpand(true)
             .vexpand(true)
-            .child(&display_box)
+            .child(&display_widget)
             .build();
         display_overlay.add_overlay(&keymap_overlay_widget);
 
@@ -141,7 +141,7 @@ impl NuxWindow {
             sidebar,
             keymap_overlay_widget,
             drop_overlay,
-            display_box,
+            display_widget,
             state,
         });
 
@@ -325,10 +325,10 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             nux.status_label.set_label("Stopped");
             // Stop scrcpy display
             if let Some(handle) = nux.state.scrcpy.borrow().as_ref() {
-                display::stop_scrcpy(&nux.display_box, handle);
+                display::stop_scrcpy(&nux.display_widget, handle);
             }
             *nux.state.scrcpy.borrow_mut() = None;
-            display::show_stopped(&nux.display_box);
+            display::show_stopped(&nux.display_widget);
             set_vm_action_sensitivity(&nux, false);
             nux.toast_overlay.add_toast(adw::Toast::new("VM stopped"));
         }
@@ -544,7 +544,7 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
 
                     // Start scrcpy embedded display
                     let scrcpy_handle =
-                        display::start_scrcpy(&nux_clone.display_box, &nux_clone.window);
+                        display::start_scrcpy(&nux_clone.display_widget, &nux_clone.window);
                     *nux_clone.state.scrcpy.borrow_mut() = Some(scrcpy_handle);
 
                     // Enable WiFi in background
