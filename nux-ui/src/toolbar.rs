@@ -5,8 +5,8 @@ use gtk4 as gtk;
 
 /// Build the right-side vertical toolbar.
 ///
-/// Contains icon buttons for: Screenshot, Volume Up, Volume Down, Shake,
-/// Rotate, Install APK, Toggle Keymap Overlay, Settings, Fullscreen.
+/// Contains icon buttons for: Start/Stop VM, Screenshot, Volume Up, Volume Down,
+/// Shake, Rotate, Install APK, Toggle Keymap Overlay, Settings, Fullscreen.
 /// Each button is wired to a `win.*` action.
 pub fn build_toolbar() -> gtk::Box {
     let toolbar = gtk::Box::builder()
@@ -24,6 +24,8 @@ pub fn build_toolbar() -> gtk::Box {
         .build();
 
     let buttons: &[(&str, &str, &str)] = &[
+        ("media-playback-start-symbolic", "Start VM", "win.start-vm"),
+        ("media-playback-stop-symbolic", "Stop VM", "win.stop-vm"),
         ("camera-photo-symbolic", "Screenshot", "win.screenshot"),
         ("audio-volume-high-symbolic", "Volume Up", "win.volume-up"),
         (

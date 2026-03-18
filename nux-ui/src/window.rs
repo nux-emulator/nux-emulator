@@ -13,12 +13,22 @@ use crate::settings;
 use crate::state::UiState;
 use crate::toolbar;
 
+use crate::vm_launcher::BootStatus;
+
+/// Events sent from background threads to the UI thread.
+#[allow(dead_code)]
+enum VmEvent {
+    Started,
+    StartFailed(String),
+    ApkInstalled(String, Result<String, String>),
+}
+
 /// Wrapper around the main application window and its key child widgets.
 pub struct NuxWindow {
     pub window: adw::ApplicationWindow,
     pub toast_overlay: adw::ToastOverlay,
     pub header_bar: adw::HeaderBar,
-    pub _status_label: gtk::Label,
+    pub status_label: gtk::Label,
     pub fps_label: gtk::Label,
     pub sidebar: gtk::Box,
     pub keymap_overlay_widget: gtk::Box,
@@ -125,7 +135,7 @@ impl NuxWindow {
             window: window.clone(),
             toast_overlay,
             header_bar,
-            _status_label: status_label,
+            status_label,
             fps_label,
             sidebar,
             keymap_overlay_widget,
@@ -146,6 +156,7 @@ impl NuxWindow {
 
 // ── Window actions ───────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn register_window_actions(nux: &Rc<NuxWindow>) {
     use gtk::gio::SimpleAction;
 
@@ -177,31 +188,52 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
     ));
     win.add_controller(esc_ctrl);
 
-    // Screenshot (stub)
+    // Screenshot
     let screenshot = SimpleAction::new("screenshot", None);
     screenshot.connect_activate(glib::clone!(
         #[strong]
         nux,
         move |_, _| {
-            log::info!("screenshot action triggered");
-            nux.toast_overlay
-                .add_toast(adw::Toast::new("Screenshot saved"));
+            let launcher = nux.state.launcher.clone();
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
+            let path = std::path::PathBuf::from(home).join("nux-screenshot.png");
+            match launcher.screenshot(&path) {
+                Ok(()) => {
+                    log::info!("screenshot saved to {}", path.display());
+                    nux.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Screenshot saved to {}",
+                        path.display()
+                    )));
+                }
+                Err(e) => {
+                    nux.toast_overlay
+                        .add_toast(adw::Toast::new(&format!("Screenshot failed: {e}")));
+                }
+            }
         }
     ));
     win.add_action(&screenshot);
 
-    // Volume up (stub)
+    // Volume up
     let vol_up = SimpleAction::new("volume-up", None);
-    vol_up.connect_activate(|_, _| {
-        log::info!("volume-up action triggered");
-    });
+    vol_up.connect_activate(glib::clone!(
+        #[strong]
+        nux,
+        move |_, _| {
+            nux.state.launcher.volume_up();
+        }
+    ));
     win.add_action(&vol_up);
 
-    // Volume down (stub)
+    // Volume down
     let vol_down = SimpleAction::new("volume-down", None);
-    vol_down.connect_activate(|_, _| {
-        log::info!("volume-down action triggered");
-    });
+    vol_down.connect_activate(glib::clone!(
+        #[strong]
+        nux,
+        move |_, _| {
+            nux.state.launcher.volume_down();
+        }
+    ));
     win.add_action(&vol_down);
 
     // Shake (stub)
@@ -218,12 +250,94 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
     });
     win.add_action(&rotate);
 
+    // ── Start VM ──
+    let start_vm = SimpleAction::new("start-vm", None);
+    start_vm.connect_activate(glib::clone!(
+        #[strong]
+        nux,
+        move |_, _| {
+            if nux.state.vm_running.get() {
+                nux.toast_overlay
+                    .add_toast(adw::Toast::new("VM is already running"));
+                return;
+            }
+
+            nux.status_label.set_label("Starting...");
+            nux.toast_overlay
+                .add_toast(adw::Toast::new("Starting VM..."));
+
+            let launcher = nux.state.launcher.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+            std::thread::spawn(move || {
+                let result = launcher.start();
+                let _ = tx.send(result);
+            });
+
+            // Poll for result on UI thread
+            let nux_clone = nux.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        nux_clone.state.vm_running.set(true);
+                        nux_clone.status_label.set_label("Booting...");
+                        set_vm_action_sensitivity(&nux_clone, true);
+                        start_boot_monitor(&nux_clone);
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(e)) => {
+                        nux_clone.status_label.set_label("Failed");
+                        nux_clone
+                            .toast_overlay
+                            .add_toast(adw::Toast::new(&format!("VM start failed: {e}")));
+                        glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        nux_clone.status_label.set_label("Failed");
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        }
+    ));
+    win.add_action(&start_vm);
+
+    // ── Stop VM ──
+    let stop_vm = SimpleAction::new("stop-vm", None);
+    stop_vm.connect_activate(glib::clone!(
+        #[strong]
+        nux,
+        move |_, _| {
+            if !nux.state.vm_running.get() {
+                nux.toast_overlay
+                    .add_toast(adw::Toast::new("VM is not running"));
+                return;
+            }
+
+            nux.status_label.set_label("Stopping...");
+            let launcher = nux.state.launcher.clone();
+            let _ = launcher.stop();
+            nux.state.vm_running.set(false);
+            nux.state.vm_booted.set(false);
+            nux.status_label.set_label("Stopped");
+            set_vm_action_sensitivity(&nux, false);
+            nux.toast_overlay.add_toast(adw::Toast::new("VM stopped"));
+        }
+    ));
+    win.add_action(&stop_vm);
+
     // Install APK via file chooser
     let install_apk = SimpleAction::new("install-apk", None);
     install_apk.connect_activate(glib::clone!(
         #[strong]
         nux,
         move |_, _| {
+            if !nux.state.vm_booted.get() {
+                nux.toast_overlay
+                    .add_toast(adw::Toast::new("VM must be booted to install APKs"));
+                return;
+            }
             open_apk_file_chooser(&nux);
         }
     ));
@@ -382,7 +496,14 @@ fn setup_drag_and_drop(nux: &Rc<NuxWindow>) {
 // ── VM-state action sensitivity ──────────────────────────────────
 
 fn set_vm_action_sensitivity(nux: &NuxWindow, running: bool) {
-    let vm_actions = ["screenshot", "volume-up", "volume-down", "shake", "rotate"];
+    let vm_actions = [
+        "screenshot",
+        "volume-up",
+        "volume-down",
+        "shake",
+        "rotate",
+        "install-apk",
+    ];
     for name in vm_actions {
         if let Some(action) = nux.window.lookup_action(name) {
             if let Some(simple) = action.downcast_ref::<gtk::gio::SimpleAction>() {
@@ -390,6 +511,54 @@ fn set_vm_action_sensitivity(nux: &NuxWindow, running: bool) {
             }
         }
     }
+}
+
+// ── Boot monitor ─────────────────────────────────────────────────
+
+fn start_boot_monitor(nux: &Rc<NuxWindow>) {
+    let nux_clone = nux.clone();
+    glib::timeout_add_seconds_local(3, move || {
+        if !nux_clone.state.vm_running.get() {
+            return glib::ControlFlow::Break;
+        }
+
+        let launcher = nux_clone.state.launcher.clone();
+        let status = launcher.check_boot_status();
+
+        match status {
+            BootStatus::Booted => {
+                if !nux_clone.state.vm_booted.get() {
+                    nux_clone.state.vm_booted.set(true);
+                    nux_clone.status_label.set_label("Running");
+                    nux_clone.toast_overlay.add_toast(adw::Toast::new(
+                        "Android booted! Display: https://localhost:8443",
+                    ));
+
+                    // Enable WiFi in background
+                    let launcher2 = launcher.clone();
+                    std::thread::spawn(move || {
+                        let _ = launcher2.enable_wifi();
+                    });
+                }
+                glib::ControlFlow::Continue
+            }
+            BootStatus::Booting => {
+                nux_clone.status_label.set_label("Booting...");
+                glib::ControlFlow::Continue
+            }
+            BootStatus::NotConnected => {
+                if !nux_clone.state.launcher.is_running() {
+                    nux_clone.state.vm_running.set(false);
+                    nux_clone.state.vm_booted.set(false);
+                    nux_clone.status_label.set_label("Stopped");
+                    set_vm_action_sensitivity(&nux_clone, false);
+                    return glib::ControlFlow::Break;
+                }
+                nux_clone.status_label.set_label("Starting...");
+                glib::ControlFlow::Continue
+            }
+        }
+    });
 }
 
 // ── APK file chooser ─────────────────────────────────────────────
@@ -417,12 +586,56 @@ fn open_apk_file_chooser(nux: &Rc<NuxWindow>) {
             move |result| {
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
+                        let filename = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("APK")
+                            .to_owned();
                         log::info!("APK selected: {}", path.display());
-                        nux.toast_overlay.add_toast(adw::Toast::new(&format!(
-                            "Installing {}...",
-                            path.file_name().and_then(|n| n.to_str()).unwrap_or("APK")
-                        )));
-                        // Actual install via nux-core::adb in integration phase
+                        nux.toast_overlay
+                            .add_toast(adw::Toast::new(&format!("Installing {filename}...")));
+                        nux.state.apk_installing.set(true);
+
+                        let launcher = nux.state.launcher.clone();
+                        let path_clone = path.clone();
+                        let filename_clone = filename.clone();
+
+                        let (tx, rx) =
+                            std::sync::mpsc::channel::<(String, Result<String, String>)>();
+
+                        std::thread::spawn(move || {
+                            let result = launcher.install_apk(&path_clone);
+                            let _ = tx.send((filename_clone, result));
+                        });
+
+                        let nux_clone = nux.clone();
+                        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                            match rx.try_recv() {
+                                Ok((name, result)) => {
+                                    nux_clone.state.apk_installing.set(false);
+                                    match result {
+                                        Ok(msg) => {
+                                            nux_clone.toast_overlay.add_toast(adw::Toast::new(
+                                                &format!("{name}: {msg}"),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            nux_clone.toast_overlay.add_toast(adw::Toast::new(
+                                                &format!("{name}: {e}"),
+                                            ));
+                                        }
+                                    }
+                                    glib::ControlFlow::Break
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    glib::ControlFlow::Continue
+                                }
+                                Err(_) => {
+                                    nux_clone.state.apk_installing.set(false);
+                                    glib::ControlFlow::Break
+                                }
+                            }
+                        });
                     }
                 }
             }

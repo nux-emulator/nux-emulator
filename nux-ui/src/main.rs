@@ -5,6 +5,7 @@ mod overlay;
 mod settings;
 mod state;
 mod toolbar;
+pub mod vm_launcher;
 mod window;
 
 use adw::prelude::*;
