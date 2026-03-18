@@ -1,14 +1,15 @@
 //! Shared UI state for cross-widget communication.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
+use crate::display::ScrcpyHandle;
 use crate::vm_launcher::{VmLaunchConfig, VmLauncher};
 
 /// Lightweight shared state for the UI layer.
 #[derive(Debug)]
 pub struct UiState {
-    /// Whether the VM is currently running (mirrors `VmState::Running`).
+    /// Whether the VM is currently running.
     pub vm_running: Cell<bool>,
     /// Whether boot has completed.
     pub vm_booted: Cell<bool>,
@@ -16,12 +17,14 @@ pub struct UiState {
     pub apk_installing: Cell<bool>,
     /// Whether fullscreen mode is active.
     pub fullscreen: Cell<bool>,
-    /// Pre-fullscreen window width (for state persistence).
+    /// Pre-fullscreen window width.
     pub pre_fs_width: Cell<i32>,
-    /// Pre-fullscreen window height (for state persistence).
+    /// Pre-fullscreen window height.
     pub pre_fs_height: Cell<i32>,
     /// VM launcher instance.
     pub launcher: Arc<VmLauncher>,
+    /// Scrcpy display handle.
+    pub scrcpy: RefCell<Option<ScrcpyHandle>>,
 }
 
 impl Default for UiState {
@@ -34,6 +37,7 @@ impl Default for UiState {
             pre_fs_width: Cell::new(1024),
             pre_fs_height: Cell::new(768),
             launcher: Arc::new(VmLauncher::new(VmLaunchConfig::default())),
+            scrcpy: RefCell::new(None),
         }
     }
 }

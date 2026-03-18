@@ -323,6 +323,11 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             nux.state.vm_running.set(false);
             nux.state.vm_booted.set(false);
             nux.status_label.set_label("Stopped");
+            // Stop scrcpy display
+            if let Some(handle) = nux.state.scrcpy.borrow().as_ref() {
+                display::stop_scrcpy(&nux.display_box, handle);
+            }
+            *nux.state.scrcpy.borrow_mut() = None;
             display::show_stopped(&nux.display_box);
             set_vm_action_sensitivity(&nux, false);
             nux.toast_overlay.add_toast(adw::Toast::new("VM stopped"));
@@ -537,8 +542,9 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
-                    // Open Android display in browser
-                    display::show_running(&nux_clone.display_box);
+                    // Start scrcpy embedded display
+                    let scrcpy_handle = display::start_scrcpy(&nux_clone.display_box);
+                    *nux_clone.state.scrcpy.borrow_mut() = Some(scrcpy_handle);
 
                     // Enable WiFi in background
                     let launcher2 = launcher.clone();
