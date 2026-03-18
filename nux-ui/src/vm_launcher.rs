@@ -106,7 +106,7 @@ impl VmLauncher {
                     "iptables",
                     "-t",
                     "nat",
-                    "-A",
+                    "-C",
                     "POSTROUTING",
                     "-s",
                     subnet,
@@ -115,10 +115,65 @@ impl VmLauncher {
                     "-j",
                     "MASQUERADE",
                 ])
-                .output();
+                .output()
+                .and_then(|o| {
+                    if !o.status.success() {
+                        Command::new("sudo")
+                            .args([
+                                "iptables",
+                                "-t",
+                                "nat",
+                                "-A",
+                                "POSTROUTING",
+                                "-s",
+                                subnet,
+                                "-o",
+                                &main_if,
+                                "-j",
+                                "MASQUERADE",
+                            ])
+                            .output()
+                    } else {
+                        Ok(o)
+                    }
+                });
         }
 
-        // nftables forwarding
+        // iptables FORWARD rules — INSERT at top (before Docker DROP policy)
+        let _ = Command::new("sudo")
+            .args([
+                "iptables",
+                "-I",
+                "FORWARD",
+                "1",
+                "-i",
+                "cvd-wtap-01",
+                "-o",
+                &main_if,
+                "-j",
+                "ACCEPT",
+            ])
+            .output();
+        let _ = Command::new("sudo")
+            .args([
+                "iptables",
+                "-I",
+                "FORWARD",
+                "2",
+                "-i",
+                &main_if,
+                "-o",
+                "cvd-wtap-01",
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ])
+            .output();
+
+        // nftables forwarding (Arch Linux uses nftables by default)
         let _ = Command::new("sudo")
             .args([
                 "nft", "add", "rule", "inet", "filter", "forward", "iifname", "cvd-*", "accept",

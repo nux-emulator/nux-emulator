@@ -1,120 +1,118 @@
 #!/usr/bin/env bash
-# setup-network.sh — Create and configure the nux-br0 bridge for TAP networking.
+#
+# Nux Emulator — one-time host network setup for Cuttlefish VM
+#
+# Run once with sudo to configure networking for the Android VM.
+# Detects the host firewall (nftables/iptables/firewalld) and
+# configures forwarding + NAT automatically.
 #
 # Usage: sudo ./scripts/setup-network.sh
 #
 # This script is idempotent: running it multiple times is safe.
-# It creates a persistent bridge via systemd-networkd that survives reboots.
-
+#
 set -euo pipefail
 
-BRIDGE_NAME="nux-br0"
-BRIDGE_SUBNET="192.168.100.0/24"
-BRIDGE_IP="192.168.100.1/24"
-GUEST_IP="192.168.100.2"
-NETWORKD_DIR="/etc/systemd/network"
-BRIDGE_NETDEV="$NETWORKD_DIR/50-nux-bridge.netdev"
-BRIDGE_NETWORK="$NETWORKD_DIR/50-nux-bridge.network"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-# ── Checks ──
+log()  { echo -e "${GREEN}[NUX]${NC} $*"; }
+warn() { echo -e "${YELLOW}[NUX]${NC} $*"; }
+err()  { echo -e "${RED}[NUX]${NC} $*" >&2; }
 
 if [[ $EUID -ne 0 ]]; then
-    echo "error: this script must be run as root (sudo)" >&2
+    err "This script must be run as root: sudo $0"
     exit 1
 fi
 
-# ── Bridge detection ──
+MAIN_IF=$(ip route | grep default | awk '{print $5}' | head -1)
+if [[ -z "$MAIN_IF" ]]; then
+    err "Could not detect main network interface"
+    exit 1
+fi
+log "Main network interface: $MAIN_IF"
 
-if ip link show "$BRIDGE_NAME" &>/dev/null; then
-    echo "bridge '$BRIDGE_NAME' already exists"
+# ── Enable IP forwarding (persistent) ──
+log "Enabling IP forwarding..."
+sysctl -qw net.ipv4.ip_forward=1
+if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.d/99-nux.conf 2>/dev/null; then
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-nux.conf
+    log "  Made persistent via /etc/sysctl.d/99-nux.conf"
+fi
 
-    # Verify it's actually a bridge
-    if [[ ! -d "/sys/class/net/$BRIDGE_NAME/bridge" ]]; then
-        echo "error: '$BRIDGE_NAME' exists but is not a bridge interface" >&2
-        exit 1
-    fi
-
-    # Verify IP is assigned
-    if ip addr show "$BRIDGE_NAME" | grep -q "inet $BRIDGE_IP"; then
-        echo "bridge IP $BRIDGE_IP is correctly configured"
+# ── Create TAP devices ──
+log "Creating TAP devices..."
+USER_NAME=${SUDO_USER:-$(whoami)}
+for tap in cvd-mtap-01 cvd-etap-01 cvd-wtap-01; do
+    if ! ip link show "$tap" &>/dev/null; then
+        ip tuntap add dev "$tap" mode tap user "$USER_NAME"
+        log "  Created $tap"
     else
-        echo "assigning IP $BRIDGE_IP to $BRIDGE_NAME"
-        ip addr add "$BRIDGE_IP" dev "$BRIDGE_NAME" 2>/dev/null || true
+        log "  $tap already exists"
     fi
+    ip link set "$tap" up
+done
 
-    # Ensure it's up
-    ip link set "$BRIDGE_NAME" up
-else
-    echo "creating bridge '$BRIDGE_NAME'"
-    ip link add name "$BRIDGE_NAME" type bridge
-    ip addr add "$BRIDGE_IP" dev "$BRIDGE_NAME"
-    ip link set "$BRIDGE_NAME" up
-    echo "bridge '$BRIDGE_NAME' created with IP $BRIDGE_IP"
+# Set gateway IP for OpenWrt WAN
+ip addr add 192.168.96.1/24 dev cvd-wtap-01 2>/dev/null || log "  Gateway IP already set"
+
+# ── Detect firewall system ──
+FIREWALL="iptables"
+if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+    FIREWALL="firewalld"
+elif command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q "inet filter"; then
+    FIREWALL="nftables"
 fi
+log "Detected firewall: $FIREWALL"
 
-# ── NAT / IP forwarding ──
+# ── Configure forwarding + NAT ──
+case "$FIREWALL" in
+    firewalld)
+        log "Configuring firewalld..."
+        firewall-cmd --permanent --zone=trusted --add-interface=cvd-mtap-01 2>/dev/null || true
+        firewall-cmd --permanent --zone=trusted --add-interface=cvd-etap-01 2>/dev/null || true
+        firewall-cmd --permanent --zone=trusted --add-interface=cvd-wtap-01 2>/dev/null || true
+        firewall-cmd --permanent --zone=trusted --add-masquerade 2>/dev/null || true
+        firewall-cmd --reload
+        log "  Added cvd-* interfaces to trusted zone with masquerade"
+        ;;
 
-echo "enabling IP forwarding"
-sysctl -q -w net.ipv4.ip_forward=1
+    nftables)
+        log "Configuring nftables + iptables..."
+        # nftables forwarding
+        if ! nft list chain inet filter forward 2>/dev/null | grep -q 'iifname "cvd-\*"'; then
+            nft add rule inet filter forward iifname "cvd-*" accept
+            nft add rule inet filter forward oifname "cvd-*" ct state established,related accept
+            log "  Added nftables forwarding rules"
+        else
+            log "  nftables forwarding rules already exist"
+        fi
+        ;;&  # fall through to also add iptables rules
 
-# Persist IP forwarding
-if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.d/99-nux-forward.conf 2>/dev/null; then
-    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-nux-forward.conf
-fi
+    iptables|nftables)
+        log "Configuring iptables..."
+        # NAT (idempotent — check before adding)
+        for subnet in 192.168.96.0/24 192.168.99.0/24; do
+            iptables -t nat -C POSTROUTING -s "$subnet" -o "$MAIN_IF" -j MASQUERADE 2>/dev/null || \
+                iptables -t nat -A POSTROUTING -s "$subnet" -o "$MAIN_IF" -j MASQUERADE
+        done
+        log "  NAT rules configured"
 
-# Add iptables MASQUERADE rule (idempotent)
-if ! iptables -t nat -C POSTROUTING -s "$BRIDGE_SUBNET" ! -o "$BRIDGE_NAME" -j MASQUERADE 2>/dev/null; then
-    echo "adding NAT masquerade rule for $BRIDGE_SUBNET"
-    iptables -t nat -A POSTROUTING -s "$BRIDGE_SUBNET" ! -o "$BRIDGE_NAME" -j MASQUERADE
-fi
-
-# Allow forwarding to/from the bridge
-if ! iptables -C FORWARD -i "$BRIDGE_NAME" -j ACCEPT 2>/dev/null; then
-    iptables -A FORWARD -i "$BRIDGE_NAME" -j ACCEPT
-fi
-if ! iptables -C FORWARD -o "$BRIDGE_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
-    iptables -A FORWARD -o "$BRIDGE_NAME" -m state --state RELATED,ESTABLISHED -j ACCEPT
-fi
-
-# ── systemd-networkd persistence ──
-
-echo "writing systemd-networkd drop-in files"
-mkdir -p "$NETWORKD_DIR"
-
-cat > "$BRIDGE_NETDEV" <<EOF
-[NetDev]
-Name=$BRIDGE_NAME
-Kind=bridge
-EOF
-
-cat > "$BRIDGE_NETWORK" <<EOF
-[Match]
-Name=$BRIDGE_NAME
-
-[Network]
-Address=$BRIDGE_IP
-DHCPServer=yes
-IPMasquerade=ipv4
-
-[DHCPServer]
-PoolOffset=2
-PoolSize=100
-DNS=8.8.8.8
-DNS=8.8.4.4
-EmitDNS=yes
-EOF
-
-# Reload networkd if it's running
-if systemctl is-active --quiet systemd-networkd; then
-    systemctl reload systemd-networkd || systemctl restart systemd-networkd
-    echo "systemd-networkd reloaded"
-fi
+        # FORWARD — INSERT at top (before Docker/other DROP rules)
+        iptables -C FORWARD -i cvd-wtap-01 -o "$MAIN_IF" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -i cvd-wtap-01 -o "$MAIN_IF" -j ACCEPT
+        iptables -C FORWARD -i "$MAIN_IF" -o cvd-wtap-01 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 2 -i "$MAIN_IF" -o cvd-wtap-01 -m state --state RELATED,ESTABLISHED -j ACCEPT
+        log "  FORWARD rules configured (inserted at top of chain)"
+        ;;
+esac
 
 echo ""
-echo "setup complete:"
-echo "  bridge:    $BRIDGE_NAME ($BRIDGE_IP)"
-echo "  subnet:    $BRIDGE_SUBNET"
-echo "  guest IP:  $GUEST_IP (via DHCP)"
-echo "  DNS:       8.8.8.8, 8.8.4.4 (forwarded to guest)"
-echo "  NAT:       enabled"
-echo "  persist:   systemd-networkd ($BRIDGE_NETDEV, $BRIDGE_NETWORK)"
+log "Network setup complete!"
+echo ""
+log "To verify after starting the emulator:"
+log "  adb -s 127.0.0.1:6520 shell ping 8.8.8.8"
+echo ""
+log "Note: TAP devices and iptables rules are not persistent across reboots."
+log "Run this script again after reboot, or add it to a systemd service."
