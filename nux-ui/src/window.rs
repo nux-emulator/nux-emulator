@@ -33,7 +33,7 @@ pub struct NuxWindow {
     pub sidebar: gtk::Box,
     pub keymap_overlay_widget: gtk::Box,
     pub drop_overlay: gtk::Box,
-    pub web_view: webkit6::WebView,
+    pub display_box: gtk::Box,
     pub state: Rc<UiState>,
 }
 
@@ -70,13 +70,13 @@ impl NuxWindow {
         header_bar.pack_end(&fps_label);
 
         // ── Display area ─────────────────────────────────────────
-        let web_view = display::build_display();
+        let display_box = display::build_display();
         let keymap_overlay_widget = overlay::build_keymap_overlay();
 
         let display_overlay = gtk::Overlay::builder()
             .hexpand(true)
             .vexpand(true)
-            .child(&web_view)
+            .child(&display_box)
             .build();
         display_overlay.add_overlay(&keymap_overlay_widget);
 
@@ -141,7 +141,7 @@ impl NuxWindow {
             sidebar,
             keymap_overlay_widget,
             drop_overlay,
-            web_view,
+            display_box,
             state,
         });
 
@@ -323,7 +323,7 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             nux.state.vm_running.set(false);
             nux.state.vm_booted.set(false);
             nux.status_label.set_label("Stopped");
-            display::clear_display(&nux.web_view);
+            display::show_stopped(&nux.display_box);
             set_vm_action_sensitivity(&nux, false);
             nux.toast_overlay.add_toast(adw::Toast::new("VM stopped"));
         }
@@ -537,17 +537,8 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
-                    // Load WebRTC display after a delay (vsock needs time to connect)
-                    let web_view = nux_clone.web_view.clone();
-                    glib::timeout_add_seconds_local_once(10, move || {
-                        display::load_webrtc_display(&web_view);
-                    });
-
-                    // Retry display load after 20s in case first attempt fails
-                    let web_view2 = nux_clone.web_view.clone();
-                    glib::timeout_add_seconds_local_once(25, move || {
-                        display::load_webrtc_display(&web_view2);
-                    });
+                    // Open Android display in browser
+                    display::show_running(&nux_clone.display_box);
 
                     // Enable WiFi in background
                     let launcher2 = launcher.clone();

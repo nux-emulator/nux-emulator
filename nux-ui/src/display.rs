@@ -1,59 +1,79 @@
-//! Display area widget — WebKitGTK view for Android display via WebRTC.
+//! Display area widget — placeholder with browser launch for Android display.
 
-use webkit6::glib;
-use webkit6::prelude::*;
+use gtk::prelude::*;
+use gtk4 as gtk;
 
-/// Build the display widget that shows the Android screen.
+/// Build the display placeholder widget.
 ///
-/// Uses WebKitGTK to render the Cuttlefish WebRTC stream directly
-/// in the GTK4 window. This gives us display + touch input + audio
-/// with zero additional infrastructure.
-pub fn build_display() -> webkit6::WebView {
-    // Use ephemeral (private) session — more lenient with certs
-    let network_session = webkit6::NetworkSession::new_ephemeral();
-
-    let web_view = webkit6::WebView::builder()
+/// Shows a status message and a button to open the display in the browser.
+/// The actual Android display is rendered via WebRTC in the default browser
+/// until we implement direct frame rendering from crosvm's Wayland socket.
+pub fn build_display() -> gtk::Box {
+    let container = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .spacing(16)
         .hexpand(true)
         .vexpand(true)
-        .network_session(&network_session)
         .build();
 
-    // When TLS fails for localhost, allow the cert and schedule a reload
-    web_view.connect_load_failed_with_tls_errors(|view, uri, cert, _errors| {
-        if uri.starts_with("https://localhost") || uri.starts_with("https://127.0.0.1") {
-            if let Some(session) = view.network_session() {
-                session.allow_tls_certificate_for_host(cert, "localhost");
-                session.allow_tls_certificate_for_host(cert, "127.0.0.1");
-            }
-            let uri_owned = uri.to_owned();
-            let view_ref = view.clone();
-            glib::idle_add_local_once(move || {
-                view_ref.load_uri(&uri_owned);
-            });
-            true
-        } else {
-            false
-        }
+    let icon = gtk::Image::builder()
+        .icon_name("computer-symbolic")
+        .pixel_size(96)
+        .css_classes(["dim-label"])
+        .build();
+
+    let label = gtk::Label::builder()
+        .label("Click Start VM to begin")
+        .css_classes(["title-2", "dim-label"])
+        .build();
+
+    let open_display_btn = gtk::Button::builder()
+        .label("Open Display in Browser")
+        .css_classes(["suggested-action", "pill"])
+        .halign(gtk::Align::Center)
+        .visible(false)
+        .build();
+
+    open_display_btn.connect_clicked(|_| {
+        let _ = std::process::Command::new("xdg-open")
+            .arg("https://localhost:8443")
+            .spawn();
     });
 
-    // Initially show black screen
-    web_view.load_html(
-        "<html><body style='background:#000;margin:0'></body></html>",
-        None,
-    );
+    container.append(&icon);
+    container.append(&label);
+    container.append(&open_display_btn);
 
-    web_view
+    container
 }
 
-/// Load the WebRTC display URL into the web view.
-pub fn load_webrtc_display(web_view: &webkit6::WebView) {
-    web_view.load_uri("https://localhost:8443/client.html?deviceId=cvd-1");
+/// Update display status when VM boots.
+pub fn show_running(display: &gtk::Box) {
+    if let Some(label) = display.last_child().and_then(|w| w.prev_sibling()) {
+        if let Some(lbl) = label.downcast_ref::<gtk::Label>() {
+            lbl.set_label("Android is running");
+        }
+    }
+    // Show the "Open Display" button
+    if let Some(btn) = display.last_child() {
+        btn.set_visible(true);
+    }
+    // Auto-open browser
+    let _ = std::process::Command::new("xdg-open")
+        .arg("https://localhost:8443")
+        .spawn();
 }
 
-/// Clear the display (show black screen).
-pub fn clear_display(web_view: &webkit6::WebView) {
-    web_view.load_html(
-        "<html><body style='background:#000;margin:0'></body></html>",
-        None,
-    );
+/// Reset display when VM stops.
+pub fn show_stopped(display: &gtk::Box) {
+    if let Some(label) = display.last_child().and_then(|w| w.prev_sibling()) {
+        if let Some(lbl) = label.downcast_ref::<gtk::Label>() {
+            lbl.set_label("Click Start VM to begin");
+        }
+    }
+    if let Some(btn) = display.last_child() {
+        btn.set_visible(false);
+    }
 }
