@@ -537,8 +537,17 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
-                    // Load WebRTC display in embedded web view
-                    display::load_webrtc_display(&nux_clone.web_view);
+                    // Load WebRTC display after a delay (vsock needs time to connect)
+                    let web_view = nux_clone.web_view.clone();
+                    glib::timeout_add_seconds_local_once(10, move || {
+                        display::load_webrtc_display(&web_view);
+                    });
+
+                    // Retry display load after 20s in case first attempt fails
+                    let web_view2 = nux_clone.web_view.clone();
+                    glib::timeout_add_seconds_local_once(25, move || {
+                        display::load_webrtc_display(&web_view2);
+                    });
 
                     // Enable WiFi in background
                     let launcher2 = launcher.clone();
