@@ -543,7 +543,8 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .add_toast(adw::Toast::new("Android booted!"));
 
                     // Start scrcpy embedded display
-                    let scrcpy_handle = display::start_scrcpy(&nux_clone.display_box);
+                    let scrcpy_handle =
+                        display::start_scrcpy(&nux_clone.display_box, &nux_clone.window);
                     *nux_clone.state.scrcpy.borrow_mut() = Some(scrcpy_handle);
 
                     // Enable WiFi in background

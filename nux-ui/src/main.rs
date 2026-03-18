@@ -17,7 +17,13 @@ use window::NuxWindow;
 
 const APP_ID: &str = "io.github.nux-emulator";
 
+#[allow(unsafe_code)]
 fn main() {
+    // Force X11 backend so we can embed scrcpy's X11 window
+    unsafe {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
+
     let app = adw::Application::builder()
         .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
