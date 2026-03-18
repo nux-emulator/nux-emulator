@@ -6,8 +6,9 @@ license.workspace = true
 
 [dependencies]
 nux-core = { path = "../nux-core" }
-gtk4 = { version = "0.9", features = ["v4_10"] }
-libadwaita = { version = "0.7", features = ["v1_5"] }
+gtk4 = { version = "0.11", features = ["v4_10"] }
+libadwaita = { version = "0.9", features = ["v1_5"] }
+webkit6 = "0.6"
 anyhow = { workspace = true }
 log = { workspace = true }
 

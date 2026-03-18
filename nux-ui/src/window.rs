@@ -33,6 +33,7 @@ pub struct NuxWindow {
     pub sidebar: gtk::Box,
     pub keymap_overlay_widget: gtk::Box,
     pub drop_overlay: gtk::Box,
+    pub web_view: webkit6::WebView,
     pub state: Rc<UiState>,
 }
 
@@ -69,13 +70,13 @@ impl NuxWindow {
         header_bar.pack_end(&fps_label);
 
         // ── Display area ─────────────────────────────────────────
-        let gl_area = display::build_display();
+        let web_view = display::build_display();
         let keymap_overlay_widget = overlay::build_keymap_overlay();
 
         let display_overlay = gtk::Overlay::builder()
             .hexpand(true)
             .vexpand(true)
-            .child(&gl_area)
+            .child(&web_view)
             .build();
         display_overlay.add_overlay(&keymap_overlay_widget);
 
@@ -140,6 +141,7 @@ impl NuxWindow {
             sidebar,
             keymap_overlay_widget,
             drop_overlay,
+            web_view,
             state,
         });
 
@@ -321,6 +323,7 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             nux.state.vm_running.set(false);
             nux.state.vm_booted.set(false);
             nux.status_label.set_label("Stopped");
+            display::clear_display(&nux.web_view);
             set_vm_action_sensitivity(&nux, false);
             nux.toast_overlay.add_toast(adw::Toast::new("VM stopped"));
         }
@@ -530,9 +533,12 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                 if !nux_clone.state.vm_booted.get() {
                     nux_clone.state.vm_booted.set(true);
                     nux_clone.status_label.set_label("Running");
-                    nux_clone.toast_overlay.add_toast(adw::Toast::new(
-                        "Android booted! Display: https://localhost:8443",
-                    ));
+                    nux_clone
+                        .toast_overlay
+                        .add_toast(adw::Toast::new("Android booted!"));
+
+                    // Load WebRTC display in embedded web view
+                    display::load_webrtc_display(&nux_clone.web_view);
 
                     // Enable WiFi in background
                     let launcher2 = launcher.clone();
