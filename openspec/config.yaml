@@ -1,0 +1,52 @@
+schema: spec-driven
+
+context: |
+  Project: Nux Emulator
+  Description: A gaming-focused Android emulator for Linux with a polished GNOME-native UI.
+
+  Tech stack:
+  - Language: Rust (entire codebase)
+  - UI: GTK4 + libadwaita via gtk-rs (gtk4 0.9.x, libadwaita 0.7.x)
+  - VMM: crosvm (KVM-accelerated)
+  - GPU: gfxstream backend (supports NVIDIA/AMD/Intel)
+  - Android: AOSP 16, x86_64
+  - Build: Cargo workspace, GitHub Actions, nektos/act for local builds
+  - Config format: TOML
+  - Packaging: .deb, .rpm, tar.gz
+
+  Architecture:
+  - nux-core: Rust library crate — VM management, display pipeline, input routing, keymap engine, ADB bridge, root manager, config, networking, audio
+  - nux-ui: Rust binary crate — GTK4 + libadwaita application (main window, toolbar, settings, overlays), depends on nux-core
+  - crosvm: External process spawned and managed by nux-core
+  - Android image: Separate build (AOSP 16 with gfxstream HALs, libndk_translation, MicroG)
+
+  Workspace structure:
+  - Cargo.toml: Workspace root with shared dependencies, edition 2024, resolver 2
+  - nux-core/: Library crate (no UI deps)
+  - nux-ui/: Binary crate (GTK4 + libadwaita frontend)
+  - keymaps/: Keymap configuration files
+  - scripts/: Development helpers (act-build.sh, install.sh, setup-kvm.sh)
+  - .github/workflows/: CI/CD workflow definitions
+
+  Conventions:
+  - All Rust, no C++ FFI needed (gtk-rs provides native Rust bindings)
+  - Wayland primary, X11 fully supported (GTK4 handles both)
+  - Single instance for v1, multi-instance deferred to v2
+  - Root via boot.img patching (Magisk/KernelSU/APatch)
+  - MicroG default, GApps optional flash
+  - crosvm source stored in /build2/crosvm/
+  - Workspace lints: clippy pedantic (warn), unsafe_code (forbid)
+  - Formatting: rustfmt with edition 2024, max_width 100
+  - Shared deps declared in [workspace.dependencies], inherited by crates
+
+  License: GPLv3
+
+rules:
+  proposal:
+    - Keep proposals focused and under 500 words
+    - Always include a "Non-goals" section
+    - Reference the overall Nux architecture when relevant
+  tasks:
+    - Break tasks into chunks of max 2 hours
+    - Each task should be independently testable
+    - Include verification steps

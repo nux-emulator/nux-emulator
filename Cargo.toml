@@ -1,0 +1,22 @@
+[workspace]
+members = ["nux-core", "nux-ui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"

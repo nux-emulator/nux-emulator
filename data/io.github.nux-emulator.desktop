@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nux Emulator
+GenericName=Android Emulator
+Comment=Gaming-focused Android emulator for Linux
+Exec=nux-emulator
+Icon=nux-emulator
+Categories=Game;Emulator;
+Keywords=android;emulator;gaming;
+Terminal=false
+StartupNotify=true

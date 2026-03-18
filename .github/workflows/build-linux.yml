@@ -1,0 +1,240 @@
+name: Build Linux Packages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+jobs:
+  build-deb:
+    name: Build .deb package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GTK4/libadwaita dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: deb-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: deb-cargo-
+
+      - name: Build release
+        run: cargo build --release --workspace
+
+      - name: Package .deb
+        run: |
+          VERSION=$(grep '^version' nux-ui/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          PKG_DIR="nux-emulator_${VERSION}_amd64"
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/usr/share/applications"
+          mkdir -p "${PKG_DIR}/usr/share/icons/hicolor/scalable/apps"
+          mkdir -p "${PKG_DIR}/usr/share/metainfo"
+          mkdir -p "${PKG_DIR}/usr/share/nux-emulator/keymaps"
+
+          cp target/release/nux-ui "${PKG_DIR}/usr/bin/nux-emulator"
+          cp data/io.github.nux-emulator.desktop "${PKG_DIR}/usr/share/applications/nux-emulator.desktop"
+          cp data/icons/io.github.nux-emulator.svg "${PKG_DIR}/usr/share/icons/hicolor/scalable/apps/nux-emulator.svg"
+          cp data/io.github.nux-emulator.metainfo.xml "${PKG_DIR}/usr/share/metainfo/nux-emulator.metainfo.xml"
+          if [ -d keymaps ] && [ "$(ls -A keymaps 2>/dev/null)" ]; then
+            cp -r keymaps/* "${PKG_DIR}/usr/share/nux-emulator/keymaps/" 2>/dev/null || true
+          fi
+
+          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+          Package: nux-emulator
+          Version: ${VERSION}
+          Section: games
+          Priority: optional
+          Architecture: amd64
+          Depends: libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.4)
+          Maintainer: Nux Emulator <nux-emulator@users.noreply.github.com>
+          Description: Gaming-focused Android emulator for Linux
+           Nux Emulator is an all-Rust, high-performance Android emulator
+           built for gaming on Linux using KVM and gfxstream GPU acceleration.
+          EOF
+          # Remove leading whitespace from control file (heredoc indentation)
+          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
+
+          dpkg-deb --build --root-owner-group "${PKG_DIR}"
+          mv "${PKG_DIR}.deb" "nux-emulator_${VERSION}_amd64.deb"
+
+      - name: Copy to build volume (act)
+        if: env.ACT == 'true'
+        run: cp nux-emulator_*.deb /build/ 2>/dev/null || true
+
+      - name: Upload .deb artifact
+        if: env.ACT != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-package
+          path: nux-emulator_*.deb
+
+  build-rpm:
+    name: Build .rpm package
+    runs-on: ubuntu-latest
+    container: fedora:41
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y gcc gtk4-devel libadwaita-devel rpm-build
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rpm-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: rpm-cargo-
+
+      - name: Build release
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --release --workspace
+
+      - name: Package .rpm
+        run: |
+          source "$HOME/.cargo/env"
+          VERSION=$(grep '^version' nux-ui/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          mkdir -p ~/rpmbuild/BUILDROOT/nux-emulator-${VERSION}-1.x86_64
+
+          BUILDROOT=~/rpmbuild/BUILDROOT/nux-emulator-${VERSION}-1.x86_64
+          mkdir -p "${BUILDROOT}/usr/bin"
+          mkdir -p "${BUILDROOT}/usr/share/applications"
+          mkdir -p "${BUILDROOT}/usr/share/icons/hicolor/scalable/apps"
+          mkdir -p "${BUILDROOT}/usr/share/metainfo"
+          mkdir -p "${BUILDROOT}/usr/share/nux-emulator/keymaps"
+
+          cp target/release/nux-ui "${BUILDROOT}/usr/bin/nux-emulator"
+          cp data/io.github.nux-emulator.desktop "${BUILDROOT}/usr/share/applications/nux-emulator.desktop"
+          cp data/icons/io.github.nux-emulator.svg "${BUILDROOT}/usr/share/icons/hicolor/scalable/apps/nux-emulator.svg"
+          cp data/io.github.nux-emulator.metainfo.xml "${BUILDROOT}/usr/share/metainfo/nux-emulator.metainfo.xml"
+          if [ -d keymaps ] && [ "$(ls -A keymaps 2>/dev/null)" ]; then
+            cp -r keymaps/* "${BUILDROOT}/usr/share/nux-emulator/keymaps/" 2>/dev/null || true
+          fi
+
+          cat > ~/rpmbuild/SPECS/nux-emulator.spec <<SPEC
+          Name:           nux-emulator
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        Gaming-focused Android emulator for Linux
+          License:        GPL-3.0
+          URL:            https://github.com/nux-emulator/nux-emulator
+
+          Requires:       gtk4 >= 4.12
+          Requires:       libadwaita >= 1.4
+
+          %description
+          Nux Emulator is an all-Rust, high-performance Android emulator
+          built for gaming on Linux using KVM and gfxstream GPU acceleration.
+
+          %install
+          # Files already placed in BUILDROOT by the workflow
+
+          %files
+          /usr/bin/nux-emulator
+          /usr/share/applications/nux-emulator.desktop
+          /usr/share/icons/hicolor/scalable/apps/nux-emulator.svg
+          /usr/share/metainfo/nux-emulator.metainfo.xml
+          %dir /usr/share/nux-emulator
+          %dir /usr/share/nux-emulator/keymaps
+          /usr/share/nux-emulator/keymaps/*
+          SPEC
+          sed -i 's/^          //' ~/rpmbuild/SPECS/nux-emulator.spec
+
+          rpmbuild -bb --define "_topdir $HOME/rpmbuild" ~/rpmbuild/SPECS/nux-emulator.spec
+          cp ~/rpmbuild/RPMS/x86_64/nux-emulator-*.rpm .
+
+      - name: Copy to build volume (act)
+        if: env.ACT == 'true'
+        run: cp nux-emulator-*.rpm /build/ 2>/dev/null || true
+
+      - name: Upload .rpm artifact
+        if: env.ACT != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-package
+          path: nux-emulator-*.rpm
+
+  build-binary:
+    name: Build portable tarball
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GTK4/libadwaita dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bin-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: bin-cargo-
+
+      - name: Build release
+        run: cargo build --release --workspace
+
+      - name: Assemble tarball
+        run: |
+          VERSION=$(grep '^version' nux-ui/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          DIST_DIR="nux-emulator-${VERSION}-linux-x86_64"
+          mkdir -p "${DIST_DIR}/keymaps"
+
+          cp target/release/nux-ui "${DIST_DIR}/nux-emulator"
+          cp data/io.github.nux-emulator.desktop "${DIST_DIR}/nux-emulator.desktop"
+          cp data/icons/io.github.nux-emulator.svg "${DIST_DIR}/nux-emulator.svg"
+          cp data/io.github.nux-emulator.metainfo.xml "${DIST_DIR}/nux-emulator.metainfo.xml"
+          cp scripts/install.sh "${DIST_DIR}/install.sh"
+          chmod +x "${DIST_DIR}/install.sh"
+          if [ -d keymaps ] && [ "$(ls -A keymaps 2>/dev/null)" ]; then
+            cp -r keymaps/* "${DIST_DIR}/keymaps/" 2>/dev/null || true
+          fi
+
+          tar czf "${DIST_DIR}.tar.gz" "${DIST_DIR}"
+
+      - name: Copy to build volume (act)
+        if: env.ACT == 'true'
+        run: cp nux-emulator-*.tar.gz /build/ 2>/dev/null || true
+
+      - name: Upload .tar.gz artifact
+        if: env.ACT != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-package
+          path: nux-emulator-*.tar.gz

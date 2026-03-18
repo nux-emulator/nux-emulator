@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.nux-emulator</id>
+  <name>Nux Emulator</name>
+  <summary>Gaming-focused Android emulator for Linux</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0</project_license>
+
+  <description>
+    <p>
+      Nux Emulator is an all-Rust, high-performance Android emulator built for
+      gaming on Linux. It uses KVM virtualization via crosvm and GPU acceleration
+      via gfxstream to deliver near-native performance.
+    </p>
+    <p>
+      Features include GTK4/libadwaita UI, customizable keymapping, ADB bridge,
+      root management, and optional Google Services via MicroG.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">nux-emulator.desktop</launchable>
+
+  <url type="homepage">https://github.com/nux-emulator/nux-emulator</url>
+  <url type="bugtracker">https://github.com/nux-emulator/nux-emulator/issues</url>
+
+  <provides>
+    <binary>nux-emulator</binary>
+  </provides>
+
+  <content_rating type="oars-1.1" />
+</component>
