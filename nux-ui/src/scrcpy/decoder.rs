@@ -1,4 +1,4 @@
-//! FFmpeg H.264 decoder — decodes video packets into RGB frames.
+//! FFmpeg H.264 decoder — decodes raw H.264 stream into RGB frames.
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::codec;
@@ -6,7 +6,7 @@ use ffmpeg_next::format::Pixel;
 use ffmpeg_next::software::scaling;
 
 /// Decoded RGB frame ready for rendering.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
@@ -15,6 +15,7 @@ pub struct DecodedFrame {
 }
 
 /// H.264 decoder using FFmpeg.
+/// Accepts raw H.264 byte chunks and outputs RGB frames.
 pub struct H264Decoder {
     decoder: codec::decoder::Video,
     scaler: Option<scaling::Context>,
@@ -49,38 +50,18 @@ impl H264Decoder {
         })
     }
 
-    /// Decode an H.264 packet and return decoded RGB frames.
-    pub fn decode(&mut self, data: &[u8], pts: i64) -> Vec<DecodedFrame> {
+    /// Feed raw H.264 bytes and return any decoded RGB frames.
+    pub fn decode_chunk(&mut self, data: &[u8]) -> Vec<DecodedFrame> {
         let mut frames = Vec::new();
 
         let packet = codec::packet::Packet::copy(data);
-        // Set PTS on the packet
-        let mut pkt = packet;
-        pkt.set_pts(Some(pts));
 
-        if self.decoder.send_packet(&pkt).is_err() {
-            return frames;
-        }
-
-        let mut decoded = ffmpeg::frame::Video::empty();
-        while self.decoder.receive_frame(&mut decoded).is_ok() {
-            if let Some(frame) = self.convert_frame(&decoded) {
-                frames.push(frame);
-            }
-        }
-
-        frames
-    }
-
-    /// Flush the decoder (call at end of stream).
-    pub fn flush(&mut self) -> Vec<DecodedFrame> {
-        let mut frames = Vec::new();
-        let _ = self.decoder.send_eof();
-
-        let mut decoded = ffmpeg::frame::Video::empty();
-        while self.decoder.receive_frame(&mut decoded).is_ok() {
-            if let Some(frame) = self.convert_frame(&decoded) {
-                frames.push(frame);
+        if self.decoder.send_packet(&packet).is_ok() {
+            let mut decoded = ffmpeg::frame::Video::empty();
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                if let Some(frame) = self.convert_frame(&decoded) {
+                    frames.push(frame);
+                }
             }
         }
 
@@ -95,7 +76,6 @@ impl H264Decoder {
             return None;
         }
 
-        // Recreate scaler if dimensions changed
         if width != self.last_width || height != self.last_height || self.scaler.is_none() {
             self.scaler = scaling::Context::get(
                 frame.format(),

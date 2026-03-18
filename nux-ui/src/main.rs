@@ -19,6 +19,8 @@ use window::NuxWindow;
 const APP_ID: &str = "io.github.nux-emulator";
 
 fn main() {
+    env_logger::init();
+
     let app = adw::Application::builder()
         .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
