@@ -271,22 +271,23 @@ fn run_stream(
     log::info!("display: checking device...");
     server::check_device()?;
 
-    log::info!("display: starting screenrecord stream...");
-    let mut child = connection::start_screen_stream(720, 1280)?;
-
-    let stdout = child
-        .stdout
-        .as_mut()
-        .ok_or_else(|| "No stdout from screenrecord".to_owned())?;
+    log::info!("display: connecting via scrcpy protocol...");
+    let mut conn = server::ScrcpyConnection::connect(720, 8_000_000)?;
 
     log::info!("display: initializing H.264 decoder...");
     let mut h264 = decoder::H264Decoder::new()?;
 
     log::info!("display: streaming frames...");
+    let mut buf = [0u8; 65536];
 
     while running.load(Ordering::Relaxed) {
-        match h264.read_and_decode(stdout) {
-            Ok(frames) => {
+        match conn.read_video(&mut buf) {
+            Ok(0) => {
+                log::info!("display: stream ended (EOF)");
+                break;
+            }
+            Ok(n) => {
+                let frames = h264.decode_chunk(&buf[..n]);
                 for frame in frames {
                     video_width.store(frame.width, Ordering::Relaxed);
                     video_height.store(frame.height, Ordering::Relaxed);
@@ -305,8 +306,6 @@ fn run_stream(
         }
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
     log::info!("display: stream stopped");
     Ok(())
 }
