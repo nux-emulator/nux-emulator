@@ -33,7 +33,7 @@ pub struct NuxWindow {
     pub sidebar: gtk::Box,
     pub keymap_overlay_widget: gtk::Box,
     pub drop_overlay: gtk::Box,
-    pub display_widget: gtk::Picture,
+    pub display_widget: gtk::Overlay,
     pub state: Rc<UiState>,
 }
 
@@ -73,12 +73,8 @@ impl NuxWindow {
         let display_widget = display::build_display();
         let keymap_overlay_widget = overlay::build_keymap_overlay();
 
-        let display_overlay = gtk::Overlay::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .child(&display_widget)
-            .build();
-        display_overlay.add_overlay(&keymap_overlay_widget);
+        // Add keymap overlay on top of the display
+        display_widget.add_overlay(&keymap_overlay_widget);
 
         // ── APK drop overlay (visual feedback) ───────────────────
         let drop_overlay = gtk::Box::builder()
@@ -99,7 +95,7 @@ impl NuxWindow {
             .build();
         drop_overlay.append(&drop_icon);
         drop_overlay.append(&drop_label);
-        display_overlay.add_overlay(&drop_overlay);
+        display_widget.add_overlay(&drop_overlay);
 
         // ── Sidebar toolbar ──────────────────────────────────────
         let sidebar = toolbar::build_toolbar();
@@ -108,7 +104,7 @@ impl NuxWindow {
         let hbox = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .build();
-        hbox.append(&display_overlay);
+        hbox.append(&display_widget);
         hbox.append(&sidebar);
 
         let toast_overlay = adw::ToastOverlay::new();
