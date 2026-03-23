@@ -34,6 +34,7 @@ pub struct NuxWindow {
     pub keymap_overlay_widget: gtk::Box,
     pub drop_overlay: gtk::Box,
     pub display_widget: gtk::Overlay,
+    pub input_area: gtk::DrawingArea,
     pub state: Rc<UiState>,
 }
 
@@ -70,7 +71,7 @@ impl NuxWindow {
         header_bar.pack_end(&fps_label);
 
         // ── Display area ─────────────────────────────────────────
-        let display_widget = display::build_display();
+        let (display_widget, input_area) = display::build_display();
         let keymap_overlay_widget = overlay::build_keymap_overlay();
 
         // Add keymap overlay on top of the display
@@ -138,6 +139,7 @@ impl NuxWindow {
             keymap_overlay_widget,
             drop_overlay,
             display_widget,
+            input_area,
             state,
         });
 
@@ -539,8 +541,11 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .add_toast(adw::Toast::new("Android booted!"));
 
                     // Start scrcpy embedded display
-                    let scrcpy_handle =
-                        display::start_scrcpy(&nux_clone.display_widget, &nux_clone.window);
+                    let scrcpy_handle = display::start_scrcpy(
+                        &nux_clone.display_widget,
+                        &nux_clone.input_area,
+                        &nux_clone.window,
+                    );
                     *nux_clone.state.scrcpy.borrow_mut() = Some(scrcpy_handle);
 
                     // Enable WiFi in background

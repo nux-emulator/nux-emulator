@@ -11,19 +11,26 @@ use libadwaita as adw;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use crate::scrcpy::{connection, decoder, input, server};
+use crate::scrcpy::{decoder, input::AdbInput, server};
 
 /// Handle to the running display stream.
-#[derive(Debug)]
 pub struct ScrcpyHandle {
     running: Arc<AtomicBool>,
-    /// Android screen dimensions (set when first frame arrives).
     video_width: Arc<AtomicU32>,
     video_height: Arc<AtomicU32>,
+    input: Arc<Mutex<Option<AdbInput>>>,
+}
+
+impl std::fmt::Debug for ScrcpyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScrcpyHandle")
+            .field("running", &self.running.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl ScrcpyHandle {
@@ -31,10 +38,12 @@ impl ScrcpyHandle {
         self.running.store(false, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn video_width(&self) -> u32 {
         self.video_width.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn video_height(&self) -> u32 {
         self.video_height.load(Ordering::Relaxed)
     }
@@ -47,7 +56,7 @@ impl Drop for ScrcpyHandle {
 }
 
 /// Build the display widget with input controllers.
-pub fn build_display() -> gtk::Overlay {
+pub fn build_display() -> (gtk::Overlay, gtk::DrawingArea) {
     let picture = gtk::Picture::builder()
         .hexpand(true)
         .vexpand(true)
@@ -69,11 +78,15 @@ pub fn build_display() -> gtk::Overlay {
         .build();
     overlay.add_overlay(&input_area);
 
-    overlay
+    (overlay, input_area)
 }
 
 /// Start streaming and set up input routing.
-pub fn start_scrcpy(overlay: &gtk::Overlay, _window: &adw::ApplicationWindow) -> ScrcpyHandle {
+pub fn start_scrcpy(
+    overlay: &gtk::Overlay,
+    input_area: &gtk::DrawingArea,
+    _window: &adw::ApplicationWindow,
+) -> ScrcpyHandle {
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
     let video_width = Arc::new(AtomicU32::new(720));
@@ -81,7 +94,9 @@ pub fn start_scrcpy(overlay: &gtk::Overlay, _window: &adw::ApplicationWindow) ->
     let vw = video_width.clone();
     let vh = video_height.clone();
 
-    // Get the picture widget (first child of overlay)
+    // Start persistent ADB input shell
+    let input: Arc<Mutex<Option<AdbInput>>> = Arc::new(Mutex::new(AdbInput::new().ok()));
+
     let picture = overlay
         .child()
         .and_then(|w| w.downcast::<gtk::Picture>().ok())
@@ -109,69 +124,50 @@ pub fn start_scrcpy(overlay: &gtk::Overlay, _window: &adw::ApplicationWindow) ->
         glib::ControlFlow::Continue
     });
 
-    // Set up input controllers on the overlay's input area
-    let input_area = overlay
-        .observe_children()
-        .into_iter()
-        .filter_map(|item| item.ok())
-        .find_map(|w| w.downcast::<gtk::DrawingArea>().ok());
-
     let handle = ScrcpyHandle {
         running,
         video_width: video_width.clone(),
         video_height: video_height.clone(),
+        input: input.clone(),
     };
 
-    if let Some(area) = input_area {
-        setup_input_controllers(&area, &picture, video_width, video_height);
-    }
+    setup_input_controllers(input_area, &picture, video_width, video_height, input);
+    log::info!("display: input controllers attached");
 
     handle
 }
 
-/// Set up mouse click and drag controllers.
+/// Set up mouse click and drag controllers using persistent ADB input.
 fn setup_input_controllers(
     area: &gtk::DrawingArea,
     picture: &gtk::Picture,
     video_width: Arc<AtomicU32>,
     video_height: Arc<AtomicU32>,
+    input: Arc<Mutex<Option<AdbInput>>>,
 ) {
-    // Track press position for swipe detection
-    let press_x = Rc::new(Cell::new(0.0f64));
-    let press_y = Rc::new(Cell::new(0.0f64));
-
     // Click gesture → tap
     let click = gtk::GestureClick::new();
-    click.set_button(1); // Left click
+    click.set_button(1);
 
     let pic = picture.clone();
     let vw = video_width.clone();
     let vh = video_height.clone();
-    let px = press_x.clone();
-    let py = press_y.clone();
-
-    click.connect_pressed(move |_, _, x, y| {
-        px.set(x);
-        py.set(y);
-    });
-
-    let pic2 = picture.clone();
-    let vw2 = video_width.clone();
-    let vh2 = video_height.clone();
+    let inp = input.clone();
 
     click.connect_released(move |_, _, x, y| {
-        let (ax, ay) = widget_to_android(
-            &pic2,
-            x,
-            y,
-            vw2.load(Ordering::Relaxed),
-            vh2.load(Ordering::Relaxed),
-        );
+        let w = pic.width() as f64;
+        let h = pic.height() as f64;
+        let vw_val = vw.load(Ordering::Relaxed);
+        let vh_val = vh.load(Ordering::Relaxed);
+        log::info!("CLICK widget({x:.0},{y:.0}) picture={w}x{h} video={vw_val}x{vh_val}");
+        let (ax, ay) = widget_to_android(&pic, x, y, vw_val, vh_val);
+        log::info!("  → android({ax},{ay})");
         if ax >= 0 && ay >= 0 {
-            log::debug!("tap: widget({x:.0},{y:.0}) → android({ax},{ay})");
-            std::thread::spawn(move || {
-                input::send_tap(ax, ay);
-            });
+            if let Ok(guard) = inp.lock() {
+                if let Some(adb) = guard.as_ref() {
+                    adb.tap(ax, ay);
+                }
+            }
         }
     });
     area.add_controller(click);
@@ -179,35 +175,39 @@ fn setup_input_controllers(
     // Right click → back button
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
+    let inp2 = input.clone();
     right_click.connect_released(move |_, _, _, _| {
-        std::thread::spawn(|| {
-            input::send_key(input::KEYCODE_BACK);
-        });
+        if let Ok(guard) = inp2.lock() {
+            if let Some(adb) = guard.as_ref() {
+                adb.back();
+            }
+        }
     });
     area.add_controller(right_click);
 
     // Drag gesture → swipe
     let drag = gtk::GestureDrag::new();
-    let pic3 = picture.clone();
-    let vw3 = video_width;
-    let vh3 = video_height;
+    let pic2 = picture.clone();
+    let vw2 = video_width;
+    let vh2 = video_height;
+    let inp3 = input;
 
     drag.connect_drag_end(move |gesture, offset_x, offset_y| {
         if let Some((start_x, start_y)) = gesture.start_point() {
             let end_x = start_x + offset_x;
             let end_y = start_y + offset_y;
-            let vw = vw3.load(Ordering::Relaxed);
-            let vh = vh3.load(Ordering::Relaxed);
-            let (ax1, ay1) = widget_to_android(&pic3, start_x, start_y, vw, vh);
-            let (ax2, ay2) = widget_to_android(&pic3, end_x, end_y, vw, vh);
+            let vw = vw2.load(Ordering::Relaxed);
+            let vh = vh2.load(Ordering::Relaxed);
+            let (ax1, ay1) = widget_to_android(&pic2, start_x, start_y, vw, vh);
+            let (ax2, ay2) = widget_to_android(&pic2, end_x, end_y, vw, vh);
 
-            // Only send swipe if distance > 10px
             let dist = ((offset_x * offset_x + offset_y * offset_y) as f64).sqrt();
             if dist > 10.0 && ax1 >= 0 && ay1 >= 0 {
-                log::debug!("swipe: ({ax1},{ay1}) → ({ax2},{ay2})");
-                std::thread::spawn(move || {
-                    input::send_swipe(ax1, ay1, ax2, ay2, 300);
-                });
+                if let Ok(guard) = inp3.lock() {
+                    if let Some(adb) = guard.as_ref() {
+                        adb.swipe(ax1, ay1, ax2, ay2, 300);
+                    }
+                }
             }
         }
     });
@@ -215,7 +215,8 @@ fn setup_input_controllers(
 }
 
 /// Map widget coordinates to Android screen coordinates.
-/// Accounts for the GtkPicture's content-fit scaling.
+/// Maps from widget space → video space → actual screen space.
+/// Video may be scaled down (max_size), but adb input expects real screen coords.
 fn widget_to_android(
     picture: &gtk::Picture,
     wx: f64,
@@ -230,34 +231,36 @@ fn widget_to_android(
         return (-1, -1);
     }
 
+    // Actual Android screen resolution (adb input expects these coords)
+    // The video may be scaled down by scrcpy's max_size parameter
+    let screen_w = 720.0f64;
+    let screen_h = 1280.0f64;
+
     let video_aspect = video_w as f64 / video_h as f64;
     let widget_aspect = widget_w / widget_h;
 
     // Calculate the rendered area within the widget (content-fit: contain)
     let (render_w, render_h, offset_x, offset_y) = if video_aspect > widget_aspect {
-        // Video is wider — letterboxed top/bottom
         let rw = widget_w;
         let rh = widget_w / video_aspect;
         (rw, rh, 0.0, (widget_h - rh) / 2.0)
     } else {
-        // Video is taller — pillarboxed left/right
         let rh = widget_h;
         let rw = widget_h * video_aspect;
         (rw, rh, (widget_w - rw) / 2.0, 0.0)
     };
 
-    // Map widget coords to video coords
-    let vx = (wx - offset_x) / render_w * video_w as f64;
-    let vy = (wy - offset_y) / render_h * video_h as f64;
-
-    // Clamp to video bounds
-    let ax = vx.round().clamp(0.0, video_w as f64 - 1.0) as i32;
-    let ay = vy.round().clamp(0.0, video_h as f64 - 1.0) as i32;
-
     // Check if click was outside the rendered area
     if wx < offset_x || wx > offset_x + render_w || wy < offset_y || wy > offset_y + render_h {
         return (-1, -1);
     }
+
+    // Map widget coords → normalized (0..1) → actual screen coords
+    let nx = (wx - offset_x) / render_w;
+    let ny = (wy - offset_y) / render_h;
+
+    let ax = (nx * screen_w).round().clamp(0.0, screen_w - 1.0) as i32;
+    let ay = (ny * screen_h).round().clamp(0.0, screen_h - 1.0) as i32;
 
     (ax, ay)
 }
@@ -272,7 +275,7 @@ fn run_stream(
     server::check_device()?;
 
     log::info!("display: connecting via scrcpy protocol...");
-    let mut conn = server::ScrcpyConnection::connect(720, 8_000_000)?;
+    let mut conn = server::ScrcpyConnection::connect(0, 16_000_000)?;
 
     log::info!("display: initializing H.264 decoder...");
     let mut h264 = decoder::H264Decoder::new()?;

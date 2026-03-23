@@ -34,15 +34,15 @@ impl ScrcpyConnection {
         log::info!("scrcpy: setting up forward tunnel on port {local_port}...");
         setup_forward(local_port)?;
 
-        // 3. Start server in forward mode
+        // 3. Start server (control=false, video only)
         log::info!("scrcpy: starting server...");
         let server_process = start_server(local_port, max_size, bit_rate)?;
 
-        // 4. Connect to the video socket (retry until server is ready)
-        log::info!("scrcpy: connecting to video stream...");
-        let video_stream = connect_with_retry(local_port, 30)?;
+        // 4. Connect video socket
+        log::info!("scrcpy: connecting video stream...");
+        let video_stream = connect_with_retry(local_port, 30, true)?;
 
-        // 5. Read device name (64 bytes)
+        // 5. Read status + device name
         let device_name = read_device_name(&video_stream)?;
         log::info!("scrcpy: connected to device: {device_name}");
 
@@ -138,15 +138,21 @@ fn start_server(local_port: u16, max_size: u16, bit_rate: u32) -> Result<Child, 
         .map_err(|e| format!("Start server: {e}"))
 }
 
-fn connect_with_retry(port: u16, max_attempts: u32) -> Result<TcpStream, String> {
-    // Give server time to start listening
-    std::thread::sleep(Duration::from_secs(2));
+fn connect_with_retry(
+    port: u16,
+    max_attempts: u32,
+    initial_delay: bool,
+) -> Result<TcpStream, String> {
+    if initial_delay {
+        // Give server time to start listening
+        std::thread::sleep(Duration::from_secs(2));
+    }
 
     for attempt in 1..=max_attempts {
         match TcpStream::connect(format!("127.0.0.1:{port}")) {
             Ok(stream) => {
                 stream.set_nodelay(true).ok();
-                stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
                 log::info!("scrcpy: connected on attempt {attempt}");
                 return Ok(stream);
             }
