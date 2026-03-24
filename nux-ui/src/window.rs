@@ -31,7 +31,7 @@ pub struct NuxWindow {
     pub status_label: gtk::Label,
     pub fps_label: gtk::Label,
     pub sidebar: gtk::Box,
-    pub keymap_overlay_widget: gtk::Box,
+    pub keymap_overlay_widget: gtk::Fixed,
     pub drop_overlay: gtk::Box,
     pub display_widget: gtk::Overlay,
     pub input_area: gtk::DrawingArea,
@@ -417,6 +417,35 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
         nux,
         move |_, _| {
             let vis = nux.keymap_overlay_widget.is_visible();
+            if !vis {
+                // Load keymap and render hints
+                let engine = nux_core::keymap::KeymapEngine::new();
+                let keymap_path = std::path::Path::new("keymaps/generic-moba.toml");
+                if keymap_path.exists() {
+                    if let Err(e) = engine.load_file(keymap_path, (720, 1280)) {
+                        log::error!("keymap: load failed: {e}");
+                    } else {
+                        let hints = engine.overlay_hints();
+                        let w = nux.display_widget.child().map(|c| c.width()).unwrap_or(720);
+                        let h = nux
+                            .display_widget
+                            .child()
+                            .map(|c| c.height())
+                            .unwrap_or(1280);
+                        overlay::update_overlay(
+                            &nux.keymap_overlay_widget,
+                            &hints,
+                            w,
+                            h,
+                            720,
+                            1280,
+                        );
+                        log::info!("keymap: loaded {} hints", hints.len());
+                    }
+                } else {
+                    log::warn!("keymap: no keymap file found at {}", keymap_path.display());
+                }
+            }
             nux.keymap_overlay_widget.set_visible(!vis);
         }
     ));

@@ -1,0 +1,72 @@
+# Sample keymap for a generic MOBA/action game
+# Resolution matches the Android display (720x1280)
+
+[meta]
+name = "Generic MOBA"
+game_package = "com.example.moba"
+resolution = [720, 1280]
+
+[[bindings]]
+type = "Tap"
+key = "q"
+position = { x = 520, y = 1050 }
+
+[[bindings]]
+type = "Tap"
+key = "w"
+position = { x = 600, y = 970 }
+
+[[bindings]]
+type = "Tap"
+key = "e"
+position = { x = 680, y = 1050 }
+
+[[bindings]]
+type = "Tap"
+key = "r"
+position = { x = 600, y = 1130 }
+
+[[bindings]]
+type = "Tap"
+key = "d"
+position = { x = 440, y = 1050 }
+
+[[bindings]]
+type = "Tap"
+key = "f"
+position = { x = 440, y = 1130 }
+
+# Movement joystick (left side)
+[[bindings]]
+type = "Joystick"
+key = "w"
+up = "w"
+down = "s"
+left = "a"
+right = "d"
+center = { x = 150, y = 900 }
+radius = 120
+
+# Attack button
+[[bindings]]
+type = "Tap"
+key = "space"
+position = { x = 600, y = 1050 }
+
+# Back button
+[[bindings]]
+type = "Tap"
+key = "escape"
+position = { x = 360, y = 80 }
+
+# Map / minimap tap
+[[bindings]]
+type = "Tap"
+key = "m"
+position = { x = 80, y = 200 }
+
+# Shop
+[[bindings]]
+type = "Tap"
+key = "b"
+position = { x = 640, y = 80 }
