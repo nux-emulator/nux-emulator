@@ -8,6 +8,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{
     Arc, Mutex,
@@ -104,6 +105,8 @@ pub fn start_wayland_display(
     let rc2 = render_count.clone();
     let vw2 = video_width.clone();
     let vh2 = video_height.clone();
+    // Keep previous frame alive so its mmap'd memory isn't freed while GTK uses it
+    let prev_frame: Rc<RefCell<Option<WaylandFrame>>> = Rc::new(RefCell::new(None));
 
     picture.add_tick_callback(move |pic, _clock| {
         if let Some(frame_data) = frame_slot.take() {
@@ -120,9 +123,13 @@ pub fn start_wayland_display(
                 FrameData::Shm(frame) => {
                     vw2.store(frame.width, Ordering::Relaxed);
                     vh2.store(frame.height, Ordering::Relaxed);
-                    // Zero-copy: glib::Bytes references the mmap'd memory directly
+                    // True zero-copy: transmute lifetime to 'static since
+                    // Arc<PoolMmap> keeps the memory alive until frame is dropped.
+                    // The frame (and its Arc) lives until the next tick replaces it.
                     let data = frame.data();
-                    let bytes = glib::Bytes::from(data);
+                    let static_data: &'static [u8] =
+                        unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+                    let bytes = glib::Bytes::from_static(static_data);
                     let texture = gdk::MemoryTexture::new(
                         frame.width as i32,
                         frame.height as i32,
@@ -131,6 +138,8 @@ pub fn start_wayland_display(
                         frame.stride as usize,
                     );
                     pic.set_paintable(Some(&texture));
+                    // Keep frame alive until next tick (prevents use-after-free)
+                    prev_frame.replace(Some(frame));
                 }
             }
         }
