@@ -24,12 +24,24 @@ use crate::wayland_protocol::{wp_virtio_gpu_metadata_v1, wp_virtio_gpu_surface_m
 // ── Public types ──
 
 /// A raw ARGB8888 frame from crosvm (shm path).
-#[derive(Clone)]
+/// Zero-copy: holds a reference to the mmap'd pool memory.
 pub struct WaylandFrame {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
-    pub data: Vec<u8>,
+    /// Reference to the mmap'd pool — keeps it alive
+    pub mmap: Arc<PoolMmap>,
+    /// Offset into the mmap where pixel data starts
+    pub offset: usize,
+    /// Length of pixel data
+    pub len: usize,
+}
+
+impl WaylandFrame {
+    /// Get the pixel data as a slice (zero-copy from mmap).
+    pub fn data(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.mmap.ptr.add(self.offset), self.len) }
+    }
 }
 
 /// Frame types — either shm pixels or dmabuf handle.
@@ -885,15 +897,14 @@ fn read_buffer_pixels(buf: &BufferData) -> Option<WaylandFrame> {
         return None;
     }
 
-    // Read directly from persistent mmap — zero syscall overhead
-    let data =
-        unsafe { std::slice::from_raw_parts(buf.mmap.ptr.add(pixel_offset), pixel_len) }.to_vec();
-
+    // Zero-copy: just reference the mmap'd memory via Arc
     Some(WaylandFrame {
         width: buf.width as u32,
         height: buf.height as u32,
         stride: buf.stride as u32,
-        data,
+        mmap: Arc::clone(&buf.mmap),
+        offset: pixel_offset,
+        len: pixel_len,
     })
 }
 

@@ -120,7 +120,9 @@ pub fn start_wayland_display(
                 FrameData::Shm(frame) => {
                     vw2.store(frame.width, Ordering::Relaxed);
                     vh2.store(frame.height, Ordering::Relaxed);
-                    let bytes = glib::Bytes::from_owned(frame.data);
+                    // Zero-copy: glib::Bytes references the mmap'd memory directly
+                    let data = frame.data();
+                    let bytes = glib::Bytes::from(data);
                     let texture = gdk::MemoryTexture::new(
                         frame.width as i32,
                         frame.height as i32,
