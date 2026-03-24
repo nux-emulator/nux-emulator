@@ -306,10 +306,13 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                             .args(["pkill", "-9", "-f", "webRTC"])
                             .output();
 
-                        // Remove the old socket and bind ours
+                        // Make the directory writable so we can bind our socket as non-root
                         let _ = std::process::Command::new("sudo")
-                            .args(["rm", "-f", frames_sock])
+                            .args(["chmod", "777", "/tmp/cf_avd_0/cvd-1/internal"])
                             .output();
+
+                        // Remove the old socket and bind ours
+                        let _ = std::fs::remove_file(frames_sock);
                         std::thread::sleep(std::time::Duration::from_millis(50));
 
                         match crate::wayland_compositor::start_compositor_at_path(frames_sock) {
