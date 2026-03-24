@@ -1,8 +1,10 @@
-//! Display area — native Wayland compositor display.
+//! Display area — GPU-accelerated rendering via GdkGLTextureBuilder.
 //!
-//! Receives raw ARGB8888 frames from crosvm via our Wayland compositor
-//! and renders them directly in a GTK4 DrawingArea. Zero encode/decode overhead.
+//! Uploads frame data to a GL texture, wraps it with GdkGLTextureBuilder,
+//! and sets it as paintable on GtkPicture. GTK composites the texture
+//! directly — no offscreen FBO (GLArea), no MemoryTexture copy.
 
+use glow::HasContext;
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
@@ -16,9 +18,10 @@ use std::sync::{
 };
 
 use crate::scrcpy::control::ControlSocket;
-use crate::wayland_compositor::{DmabufFrame, FrameData, WaylandFrame};
+use crate::wayland_compositor::{FrameData, WaylandFrame};
 
-/// Handle to the running display stream.
+// ── Types ──
+
 pub struct ScrcpyHandle {
     running: Arc<AtomicBool>,
     video_width: Arc<AtomicU32>,
@@ -39,12 +42,10 @@ impl ScrcpyHandle {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
-
     #[allow(dead_code)]
     pub fn video_width(&self) -> u32 {
         self.video_width.load(Ordering::Relaxed)
     }
-
     #[allow(dead_code)]
     pub fn video_height(&self) -> u32 {
         self.video_height.load(Ordering::Relaxed)
@@ -57,7 +58,18 @@ impl Drop for ScrcpyHandle {
     }
 }
 
-/// Build the display widget.
+// ── GL state ──
+
+struct GlState {
+    gl: glow::Context,
+    texture: glow::Texture,
+    tex_width: u32,
+    tex_height: u32,
+    gl_context: gdk::GLContext,
+}
+
+// ── Widget ──
+
 pub fn build_display() -> (gtk::Overlay, gtk::DrawingArea) {
     let picture = gtk::Picture::builder()
         .hexpand(true)
@@ -82,12 +94,13 @@ pub fn build_display() -> (gtk::Overlay, gtk::DrawingArea) {
     (overlay, input_area)
 }
 
-/// Start display from Wayland compositor frame slot.
+// ── Display start ──
+
 pub fn start_wayland_display(
     overlay: &gtk::Overlay,
     input_area: &gtk::DrawingArea,
     _window: &adw::ApplicationWindow,
-    frame_slot: std::sync::Arc<crate::wayland_compositor::FrameSlot>,
+    frame_slot: Arc<crate::wayland_compositor::FrameSlot>,
     _wayland_input: crate::wayland_compositor::WaylandInput,
 ) -> ScrcpyHandle {
     let running = Arc::new(AtomicBool::new(true));
@@ -100,46 +113,37 @@ pub fn start_wayland_display(
         .and_then(|w| w.downcast::<gtk::Picture>().ok())
         .expect("Overlay child should be a Picture");
 
-    // Render on frame clock — take latest frame from shared slot
+    let gl_state: Rc<RefCell<Option<GlState>>> = Rc::new(RefCell::new(None));
     let render_count = Rc::new(std::cell::Cell::new(0u64));
     let rc2 = render_count.clone();
     let vw2 = video_width.clone();
     let vh2 = video_height.clone();
-    // Keep previous frame alive so its mmap'd memory isn't freed while GTK uses it
-    let prev_frame: Rc<RefCell<Option<WaylandFrame>>> = Rc::new(RefCell::new(None));
+    let gs = gl_state.clone();
 
     picture.add_tick_callback(move |pic, _clock| {
         if let Some(frame_data) = frame_slot.take() {
             rc2.set(rc2.get() + 1);
 
-            match frame_data {
-                FrameData::Dmabuf(dmabuf) => {
-                    vw2.store(dmabuf.width, Ordering::Relaxed);
-                    vh2.store(dmabuf.height, Ordering::Relaxed);
-                    if let Some(texture) = create_dmabuf_texture(pic, &dmabuf) {
-                        pic.set_paintable(Some(&texture));
+            if let FrameData::Shm(frame) = frame_data {
+                vw2.store(frame.width, Ordering::Relaxed);
+                vh2.store(frame.height, Ordering::Relaxed);
+
+                // Lazy init GL
+                if gs.borrow().is_none() {
+                    match init_gl_state(pic) {
+                        Ok(state) => {
+                            log::info!("display: GL texture renderer initialized");
+                            *gs.borrow_mut() = Some(state);
+                        }
+                        Err(e) => {
+                            log::error!("display: GL init failed: {e}");
+                            return glib::ControlFlow::Continue;
+                        }
                     }
                 }
-                FrameData::Shm(frame) => {
-                    vw2.store(frame.width, Ordering::Relaxed);
-                    vh2.store(frame.height, Ordering::Relaxed);
-                    // True zero-copy: transmute lifetime to 'static since
-                    // Arc<PoolMmap> keeps the memory alive until frame is dropped.
-                    // The frame (and its Arc) lives until the next tick replaces it.
-                    let data = frame.data();
-                    let static_data: &'static [u8] =
-                        unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-                    let bytes = glib::Bytes::from_static(static_data);
-                    let texture = gdk::MemoryTexture::new(
-                        frame.width as i32,
-                        frame.height as i32,
-                        gdk::MemoryFormat::R8g8b8a8Premultiplied,
-                        &bytes,
-                        frame.stride as usize,
-                    );
-                    pic.set_paintable(Some(&texture));
-                    // Keep frame alive until next tick (prevents use-after-free)
-                    prev_frame.replace(Some(frame));
+
+                if let Some(state) = gs.borrow_mut().as_mut() {
+                    upload_and_present(state, pic, &frame);
                 }
             }
         }
@@ -152,7 +156,7 @@ pub fn start_wayland_display(
         let rendered = rc3.get();
         if rendered > 0 {
             log::info!(
-                "render: {rendered} frames rendered (render rate ~{}/s)",
+                "render: {rendered} frames (render rate ~{}/s)",
                 rendered / 2
             );
         }
@@ -167,30 +171,214 @@ pub fn start_wayland_display(
         control: control.clone(),
     };
 
-    // Use scrcpy control socket for input (ADB-based, works independently of display)
-    // Wayland seat input goes to crosvm display layer, not Android.
-    // Android input comes through vhost-user devices managed by webRTC.
-    // Since we killed webRTC, we use scrcpy control socket instead.
-    let control_for_input = control.clone();
+    // Scrcpy control for input
+    let ctrl = control.clone();
     std::thread::spawn(move || {
-        // Wait a moment for ADB to be ready
         std::thread::sleep(std::time::Duration::from_secs(3));
         match connect_scrcpy_control() {
-            Ok(ctrl) => {
-                *control_for_input.lock().unwrap() = Some(ctrl);
-                log::info!("display: scrcpy control socket connected for input");
+            Ok(c) => {
+                *ctrl.lock().unwrap() = Some(c);
+                log::info!("display: scrcpy control connected");
             }
-            Err(e) => {
-                log::error!("display: scrcpy control failed: {e}");
-            }
+            Err(e) => log::error!("display: scrcpy control failed: {e}"),
         }
     });
 
     setup_input_controllers(input_area, input_area, video_width, video_height, control);
     log::info!("display: input controllers attached");
-
     handle
 }
+
+// ── GL init ──
+
+fn init_gl_state(pic: &gtk::Picture) -> Result<GlState, String> {
+    let display = pic.display();
+    let gl_context = display
+        .create_gl_context()
+        .map_err(|e| format!("create GL context: {e}"))?;
+    gl_context.make_current();
+
+    let gl = unsafe {
+        let egl = libc::dlopen(
+            b"libEGL.so.1\0".as_ptr().cast(),
+            libc::RTLD_LAZY | libc::RTLD_NOLOAD,
+        );
+        if !egl.is_null() {
+            type F = unsafe extern "C" fn(*const std::ffi::c_char) -> *const std::ffi::c_void;
+            let f: F =
+                std::mem::transmute(libc::dlsym(egl, b"eglGetProcAddress\0".as_ptr().cast()));
+            glow::Context::from_loader_function(|name| {
+                let c = std::ffi::CString::new(name).unwrap();
+                unsafe { f(c.as_ptr()) }
+            })
+        } else {
+            let glx = libc::dlopen(
+                b"libGL.so.1\0".as_ptr().cast(),
+                libc::RTLD_LAZY | libc::RTLD_NOLOAD,
+            );
+            if glx.is_null() {
+                return Err("No GL loader".into());
+            }
+            type F = unsafe extern "C" fn(*const u8) -> *const std::ffi::c_void;
+            let f: F =
+                std::mem::transmute(libc::dlsym(glx, b"glXGetProcAddressARB\0".as_ptr().cast()));
+            glow::Context::from_loader_function(|name| {
+                let c = std::ffi::CString::new(name).unwrap();
+                unsafe { f(c.as_ptr().cast()) }
+            })
+        }
+    };
+
+    let texture = unsafe {
+        let tex = gl.create_texture().map_err(|e| e.to_string())?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        tex
+    };
+
+    Ok(GlState {
+        gl,
+        texture,
+        tex_width: 0,
+        tex_height: 0,
+        gl_context,
+    })
+}
+
+// ── Upload + present via GdkGLTextureBuilder ──
+
+fn upload_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &WaylandFrame) {
+    state.gl_context.make_current();
+
+    let gl = &state.gl;
+    let w = frame.width;
+    let h = frame.height;
+    let data = frame.data();
+
+    unsafe {
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (frame.stride / 4) as i32);
+        gl.bind_texture(glow::TEXTURE_2D, Some(state.texture));
+
+        if w != state.tex_width || h != state.tex_height {
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                w as i32,
+                h as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(data)),
+            );
+            state.tex_width = w;
+            state.tex_height = h;
+        } else {
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(data)),
+            );
+        }
+
+        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+        gl.flush();
+    }
+
+    // Wrap GL texture with GdkGLTextureBuilder — GTK uses it directly
+    let tex_id = state.texture.0.get();
+    if let Some(gdk_texture) = build_gl_texture(&state.gl_context, tex_id, w as i32, h as i32) {
+        pic.set_paintable(Some(&gdk_texture));
+    }
+}
+
+fn build_gl_texture(
+    gl_context: &gdk::GLContext,
+    tex_id: u32,
+    width: i32,
+    height: i32,
+) -> Option<gdk::Texture> {
+    use glib::translate::*;
+
+    unsafe {
+        unsafe extern "C" {
+            fn gdk_gl_texture_builder_new() -> *mut glib::gobject_ffi::GObject;
+            fn gdk_gl_texture_builder_set_context(
+                b: *mut glib::gobject_ffi::GObject,
+                ctx: *mut glib::gobject_ffi::GObject,
+            );
+            fn gdk_gl_texture_builder_set_id(b: *mut glib::gobject_ffi::GObject, id: u32);
+            fn gdk_gl_texture_builder_set_width(b: *mut glib::gobject_ffi::GObject, w: i32);
+            fn gdk_gl_texture_builder_set_height(b: *mut glib::gobject_ffi::GObject, h: i32);
+            fn gdk_gl_texture_builder_set_format(b: *mut glib::gobject_ffi::GObject, fmt: i32);
+            fn gdk_gl_texture_builder_build(
+                b: *mut glib::gobject_ffi::GObject,
+                destroy: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+                data: *mut std::ffi::c_void,
+                error: *mut *mut glib::ffi::GError,
+            ) -> *mut glib::gobject_ffi::GObject;
+            fn g_object_unref(obj: *mut glib::gobject_ffi::GObject);
+        }
+
+        let builder = gdk_gl_texture_builder_new();
+        if builder.is_null() {
+            return None;
+        }
+
+        let ctx_ptr =
+            glib::translate::ToGlibPtr::<*mut gdk::ffi::GdkGLContext>::to_glib_none(gl_context).0;
+        gdk_gl_texture_builder_set_context(builder, ctx_ptr.cast());
+        gdk_gl_texture_builder_set_id(builder, tex_id);
+        gdk_gl_texture_builder_set_width(builder, width);
+        gdk_gl_texture_builder_set_height(builder, height);
+        // GDK_MEMORY_R8G8B8A8_PREMULTIPLIED = 1
+        gdk_gl_texture_builder_set_format(builder, 1);
+
+        let mut error: *mut glib::ffi::GError = std::ptr::null_mut();
+        let texture = gdk_gl_texture_builder_build(builder, None, std::ptr::null_mut(), &mut error);
+
+        g_object_unref(builder);
+
+        if texture.is_null() {
+            if !error.is_null() {
+                let msg = std::ffi::CStr::from_ptr((*error).message).to_string_lossy();
+                log::error!("GL texture build failed: {msg}");
+                glib::ffi::g_error_free(error);
+            }
+            return None;
+        }
+
+        Some(from_glib_full(texture.cast::<gdk::ffi::GdkTexture>()))
+    }
+}
+
+// ── Input ──
 
 fn setup_input_controllers(
     area: &gtk::DrawingArea,
@@ -199,80 +387,80 @@ fn setup_input_controllers(
     video_height: Arc<AtomicU32>,
     control: Arc<Mutex<Option<ControlSocket>>>,
 ) {
-    // Right click -> back
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
-    let ctrl2 = control.clone();
+    let c2 = control.clone();
     right_click.connect_released(move |_, _, _, _| {
-        if let Ok(mut guard) = ctrl2.lock() {
-            if let Some(cs) = guard.as_mut() {
+        if let Ok(mut g) = c2.lock() {
+            if let Some(cs) = g.as_mut() {
                 cs.back();
             }
         }
     });
     area.add_controller(right_click);
 
-    // Drag gesture for taps and swipes
     let drag = gtk::GestureDrag::new();
     drag.set_button(1);
-
     let da = display_area.clone();
     let vw = video_width.clone();
     let vh = video_height.clone();
-    let ctrl3 = control.clone();
-    let area_for_focus = area.clone();
-
+    let c3 = control.clone();
+    let af = area.clone();
     drag.connect_drag_begin(move |_, x, y| {
-        area_for_focus.grab_focus();
-        let vw = vw.load(Ordering::Relaxed);
-        let vh = vh.load(Ordering::Relaxed);
-        let (ax, ay) = widget_to_android(&da, x, y, vw, vh);
+        af.grab_focus();
+        let (ax, ay) = w2a(
+            &da,
+            x,
+            y,
+            vw.load(Ordering::Relaxed),
+            vh.load(Ordering::Relaxed),
+        );
         if ax >= 0 && ay >= 0 {
-            if let Ok(mut guard) = ctrl3.lock() {
-                if let Some(cs) = guard.as_mut() {
+            if let Ok(mut g) = c3.lock() {
+                if let Some(cs) = g.as_mut() {
                     cs.touch_down(ax as u32, ay as u32);
                 }
             }
         }
     });
-
     let da3 = display_area.clone();
     let vw3 = video_width.clone();
     let vh3 = video_height.clone();
-    let ctrl4 = control.clone();
-
-    drag.connect_drag_update(move |gesture, offset_x, offset_y| {
-        if let Some((start_x, start_y)) = gesture.start_point() {
-            let x = start_x + offset_x;
-            let y = start_y + offset_y;
-            let vw = vw3.load(Ordering::Relaxed);
-            let vh = vh3.load(Ordering::Relaxed);
-            let (ax, ay) = widget_to_android(&da3, x, y, vw, vh);
+    let c4 = control.clone();
+    drag.connect_drag_update(move |gesture, ox, oy| {
+        if let Some((sx, sy)) = gesture.start_point() {
+            let (ax, ay) = w2a(
+                &da3,
+                sx + ox,
+                sy + oy,
+                vw3.load(Ordering::Relaxed),
+                vh3.load(Ordering::Relaxed),
+            );
             if ax >= 0 && ay >= 0 {
-                if let Ok(mut guard) = ctrl4.lock() {
-                    if let Some(cs) = guard.as_mut() {
+                if let Ok(mut g) = c4.lock() {
+                    if let Some(cs) = g.as_mut() {
                         cs.touch_move(ax as u32, ay as u32);
                     }
                 }
             }
         }
     });
-
     let da4 = display_area.clone();
     let vw4 = video_width;
     let vh4 = video_height;
-    let ctrl5 = control.clone();
-
-    drag.connect_drag_end(move |gesture, offset_x, offset_y| {
-        if let Some((start_x, start_y)) = gesture.start_point() {
-            let x = start_x + offset_x;
-            let y = start_y + offset_y;
-            let vw = vw4.load(Ordering::Relaxed);
-            let vh = vh4.load(Ordering::Relaxed);
-            let (ax, ay) = widget_to_android(&da4, x, y, vw, vh);
+    let c5 = control.clone();
+    drag.connect_drag_end(move |gesture, ox, oy| {
+        if let Some((sx, sy)) = gesture.start_point() {
+            let (ax, ay) = w2a(
+                &da4,
+                sx + ox,
+                sy + oy,
+                vw4.load(Ordering::Relaxed),
+                vh4.load(Ordering::Relaxed),
+            );
             if ax >= 0 && ay >= 0 {
-                if let Ok(mut guard) = ctrl5.lock() {
-                    if let Some(cs) = guard.as_mut() {
+                if let Ok(mut g) = c5.lock() {
+                    if let Some(cs) = g.as_mut() {
                         cs.touch_up(ax as u32, ay as u32);
                     }
                 }
@@ -281,23 +469,19 @@ fn setup_input_controllers(
     });
     area.add_controller(drag);
 
-    // Keyboard input
-    let key_ctrl = gtk::EventControllerKey::new();
-    let ctrl6 = control;
-
-    key_ctrl.connect_key_pressed(move |_, keyval, _keycode, modifier| {
-        if let Ok(mut guard) = ctrl6.lock() {
-            if let Some(cs) = guard.as_mut() {
-                if let Some(android_key) = gdk_key_to_android(keyval) {
-                    let meta = gdk_modifier_to_android(modifier);
-                    cs.key_meta(android_key, meta);
+    let key = gtk::EventControllerKey::new();
+    let c6 = control;
+    key.connect_key_pressed(move |_, keyval, _kc, modifier| {
+        if let Ok(mut g) = c6.lock() {
+            if let Some(cs) = g.as_mut() {
+                if let Some(ak) = k2a(keyval) {
+                    cs.key_meta(ak, m2a(modifier));
                     return glib::Propagation::Stop;
                 }
                 if let Some(ch) = keyval.to_unicode() {
                     if !ch.is_control() {
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        cs.inject_text(s);
+                        let mut b = [0u8; 4];
+                        cs.inject_text(ch.encode_utf8(&mut b));
                         return glib::Propagation::Stop;
                     }
                 }
@@ -305,105 +489,64 @@ fn setup_input_controllers(
         }
         glib::Propagation::Proceed
     });
-    area.add_controller(key_ctrl);
+    area.add_controller(key);
 }
 
-fn widget_to_android(
-    widget: &impl IsA<gtk::Widget>,
-    wx: f64,
-    wy: f64,
-    video_w: u32,
-    video_h: u32,
-) -> (i32, i32) {
-    let widget_w = widget.width() as f64;
-    let widget_h = widget.height() as f64;
-
-    if widget_w <= 0.0 || widget_h <= 0.0 || video_w == 0 || video_h == 0 {
+fn w2a(w: &impl IsA<gtk::Widget>, wx: f64, wy: f64, vw: u32, vh: u32) -> (i32, i32) {
+    let ww = w.width() as f64;
+    let wh = w.height() as f64;
+    if ww <= 0.0 || wh <= 0.0 || vw == 0 || vh == 0 {
         return (-1, -1);
     }
-
-    let screen_w = 720.0f64;
-    let screen_h = 1280.0f64;
-
-    let video_aspect = video_w as f64 / video_h as f64;
-    let widget_aspect = widget_w / widget_h;
-
-    let (render_w, render_h, offset_x, offset_y) = if video_aspect > widget_aspect {
-        let rw = widget_w;
-        let rh = widget_w / video_aspect;
-        (rw, rh, 0.0, (widget_h - rh) / 2.0)
+    let va = vw as f64 / vh as f64;
+    let wa = ww / wh;
+    let (rw, rh, ox, oy) = if va > wa {
+        (ww, ww / va, 0.0, (wh - ww / va) / 2.0)
     } else {
-        let rh = widget_h;
-        let rw = widget_h * video_aspect;
-        (rw, rh, (widget_w - rw) / 2.0, 0.0)
+        (wh * va, wh, (ww - wh * va) / 2.0, 0.0)
     };
-
-    if wx < offset_x || wx > offset_x + render_w || wy < offset_y || wy > offset_y + render_h {
+    if wx < ox || wx > ox + rw || wy < oy || wy > oy + rh {
         return (-1, -1);
     }
-
-    let nx = (wx - offset_x) / render_w;
-    let ny = (wy - offset_y) / render_h;
-
-    let ax = (nx * screen_w).round().clamp(0.0, screen_w - 1.0) as i32;
-    let ay = (ny * screen_h).round().clamp(0.0, screen_h - 1.0) as i32;
-
+    let ax = ((wx - ox) / rw * 720.0).round().clamp(0.0, 719.0) as i32;
+    let ay = ((wy - oy) / rh * 1280.0).round().clamp(0.0, 1279.0) as i32;
     (ax, ay)
 }
 
-/// Connect scrcpy control socket only (for input when using Wayland display).
 fn connect_scrcpy_control() -> Result<ControlSocket, String> {
     use crate::scrcpy::server;
-
     server::check_device()?;
-
-    // Push and start scrcpy server
     let conn = server::ScrcpyConnection::connect(0, 8_000_000)?;
-
-    // We need to keep reading the video stream or scrcpy server dies.
-    // Spawn a drain thread.
-    let mut video = conn
-        .video_stream
-        .try_clone()
-        .map_err(|e| format!("clone: {e}"))?;
+    let mut video = conn.video_stream.try_clone().map_err(|e| format!("{e}"))?;
     std::thread::spawn(move || {
-        let mut buf = [0u8; 65536];
+        let mut b = [0u8; 65536];
         loop {
-            match std::io::Read::read(&mut video, &mut buf) {
+            match std::io::Read::read(&mut video, &mut b) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {} // discard video data
+                _ => {}
             }
         }
     });
-
     let ctrl = ControlSocket::new(
         conn.control_stream
             .try_clone()
-            .map_err(|e| format!("Clone control: {e}"))?,
+            .map_err(|e| format!("{e}"))?,
         720,
         1280,
     );
-    // Keep connection alive by leaking it (it owns the server process)
     std::mem::forget(conn);
     Ok(ctrl)
 }
 
-/// Stop display stream.
 pub fn stop_scrcpy(overlay: &gtk::Overlay, handle: &ScrcpyHandle) {
     handle.stop();
-    if let Some(da) = overlay
-        .child()
-        .and_then(|w| w.downcast::<gtk::DrawingArea>().ok())
-    {
-        da.queue_draw();
-    }
 }
 
 pub fn show_stopped(_overlay: &gtk::Overlay) {}
 
-fn gdk_key_to_android(keyval: gdk::Key) -> Option<u32> {
+fn k2a(k: gdk::Key) -> Option<u32> {
     use gdk::Key;
-    Some(match keyval {
+    Some(match k {
         Key::Return | Key::KP_Enter => 66,
         Key::BackSpace => 67,
         Key::Delete | Key::KP_Delete => 112,
@@ -434,123 +577,16 @@ fn gdk_key_to_android(keyval: gdk::Key) -> Option<u32> {
     })
 }
 
-fn gdk_modifier_to_android(modifier: gdk::ModifierType) -> u32 {
-    let mut meta = 0u32;
-    if modifier.contains(gdk::ModifierType::SHIFT_MASK) {
-        meta |= 1;
+fn m2a(m: gdk::ModifierType) -> u32 {
+    let mut r = 0u32;
+    if m.contains(gdk::ModifierType::SHIFT_MASK) {
+        r |= 1;
     }
-    if modifier.contains(gdk::ModifierType::CONTROL_MASK) {
-        meta |= 0x1000;
+    if m.contains(gdk::ModifierType::CONTROL_MASK) {
+        r |= 0x1000;
     }
-    if modifier.contains(gdk::ModifierType::ALT_MASK) {
-        meta |= 0x02;
+    if m.contains(gdk::ModifierType::ALT_MASK) {
+        r |= 0x02;
     }
-    meta
-}
-
-/// Create a GdkDmabufTexture from a DMA-BUF fd via C FFI.
-/// This is zero-copy — the GPU reads the buffer directly.
-fn create_dmabuf_texture(pic: &gtk::Picture, dmabuf: &DmabufFrame) -> Option<gdk::Texture> {
-    use glib::translate::*;
-
-    unsafe {
-        // GdkDmabufTextureBuilder FFI
-        unsafe extern "C" {
-            fn gdk_dmabuf_texture_builder_new() -> *mut glib::gobject_ffi::GObject;
-            fn gdk_dmabuf_texture_builder_set_display(
-                builder: *mut glib::gobject_ffi::GObject,
-                display: *mut glib::gobject_ffi::GObject,
-            );
-            fn gdk_dmabuf_texture_builder_set_width(
-                builder: *mut glib::gobject_ffi::GObject,
-                width: u32,
-            );
-            fn gdk_dmabuf_texture_builder_set_height(
-                builder: *mut glib::gobject_ffi::GObject,
-                height: u32,
-            );
-            fn gdk_dmabuf_texture_builder_set_fourcc(
-                builder: *mut glib::gobject_ffi::GObject,
-                fourcc: u32,
-            );
-            fn gdk_dmabuf_texture_builder_set_modifier(
-                builder: *mut glib::gobject_ffi::GObject,
-                modifier: u64,
-            );
-            fn gdk_dmabuf_texture_builder_set_n_planes(
-                builder: *mut glib::gobject_ffi::GObject,
-                n_planes: u32,
-            );
-            fn gdk_dmabuf_texture_builder_set_fd(
-                builder: *mut glib::gobject_ffi::GObject,
-                plane: u32,
-                fd: i32,
-            );
-            fn gdk_dmabuf_texture_builder_set_stride(
-                builder: *mut glib::gobject_ffi::GObject,
-                plane: u32,
-                stride: u32,
-            );
-            fn gdk_dmabuf_texture_builder_set_offset(
-                builder: *mut glib::gobject_ffi::GObject,
-                plane: u32,
-                offset: u32,
-            );
-            fn gdk_dmabuf_texture_builder_set_premultiplied(
-                builder: *mut glib::gobject_ffi::GObject,
-                premultiplied: i32,
-            );
-            fn gdk_dmabuf_texture_builder_build(
-                builder: *mut glib::gobject_ffi::GObject,
-                destroy: *const std::ffi::c_void,
-                data: *mut std::ffi::c_void,
-                error: *mut *mut glib::ffi::GError,
-            ) -> *mut glib::gobject_ffi::GObject;
-            fn g_object_unref(obj: *mut glib::gobject_ffi::GObject);
-        }
-
-        let builder = gdk_dmabuf_texture_builder_new();
-        if builder.is_null() {
-            return None;
-        }
-
-        let display: gdk::Display = pic.display();
-        let display_ptr =
-            glib::translate::ToGlibPtr::<*mut gdk::ffi::GdkDisplay>::to_glib_none(&display)
-                .0
-                .cast::<glib::gobject_ffi::GObject>();
-
-        gdk_dmabuf_texture_builder_set_display(builder, display_ptr);
-        gdk_dmabuf_texture_builder_set_width(builder, dmabuf.width);
-        gdk_dmabuf_texture_builder_set_height(builder, dmabuf.height);
-        gdk_dmabuf_texture_builder_set_fourcc(builder, dmabuf.fourcc);
-        gdk_dmabuf_texture_builder_set_modifier(builder, dmabuf.modifier);
-        gdk_dmabuf_texture_builder_set_premultiplied(builder, 1);
-        gdk_dmabuf_texture_builder_set_n_planes(builder, 1);
-        gdk_dmabuf_texture_builder_set_fd(builder, 0, dmabuf.fd);
-        gdk_dmabuf_texture_builder_set_stride(builder, 0, dmabuf.stride);
-        gdk_dmabuf_texture_builder_set_offset(builder, 0, dmabuf.offset);
-
-        let mut error: *mut glib::ffi::GError = std::ptr::null_mut();
-        let texture = gdk_dmabuf_texture_builder_build(
-            builder,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            &mut error,
-        );
-
-        g_object_unref(builder);
-
-        if texture.is_null() {
-            if !error.is_null() {
-                let msg = std::ffi::CStr::from_ptr((*error).message).to_string_lossy();
-                log::error!("dmabuf texture build failed: {msg}");
-                glib::ffi::g_error_free(error);
-            }
-            return None;
-        }
-
-        // Transfer ownership to gdk::Texture
-        Some(from_glib_full(texture.cast::<gdk::ffi::GdkTexture>()))
-    }
+    r
 }
