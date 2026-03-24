@@ -147,10 +147,31 @@ struct SurfaceData {
 struct ShmPoolData {
     fd: Arc<OwnedFd>,
     len: usize,
+    /// Persistent mmap — shared with buffers via Arc
+    mmap: Arc<PoolMmap>,
 }
+
+/// Persistent mmap of a shm pool. Unmapped on drop.
+struct PoolMmap {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for PoolMmap {}
+unsafe impl Sync for PoolMmap {}
+
+impl Drop for PoolMmap {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                libc::munmap(self.ptr.cast(), self.len);
+            }
+        }
+    }
+}
+
 struct BufferData {
-    pool_fd: Arc<OwnedFd>,
-    pool_len: usize,
+    mmap: Arc<PoolMmap>,
     offset: i32,
     width: i32,
     height: i32,
@@ -381,11 +402,36 @@ impl Dispatch<wl_shm::WlShm, ()> for Compositor {
         if let wl_shm::Request::CreatePool { id, fd, size } = req {
             let raw_fd = fd.as_raw_fd();
             let owned = unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(raw_fd).unwrap()) };
+            let len = size as usize;
+
+            // Persistent mmap — stays alive via Arc, shared with buffers
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    owned.as_raw_fd(),
+                    0,
+                )
+            };
+            let mmap_ptr = if ptr == libc::MAP_FAILED {
+                log::error!(
+                    "wayland: pool mmap failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                std::ptr::null_mut()
+            } else {
+                ptr.cast::<u8>()
+            };
+
+            let mmap = Arc::new(PoolMmap { ptr: mmap_ptr, len });
             di.init(
                 id,
                 ShmPoolData {
                     fd: Arc::new(owned),
-                    len: size as usize,
+                    len,
+                    mmap,
                 },
             );
         }
@@ -414,8 +460,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for Compositor {
             di.init(
                 id,
                 BufferData {
-                    pool_fd: Arc::clone(&data.fd),
-                    pool_len: data.len,
+                    mmap: Arc::clone(&data.mmap),
                     offset,
                     width,
                     height,
@@ -675,30 +720,19 @@ impl Dispatch<wp_virtio_gpu_surface_metadata_v1::WpVirtioGpuSurfaceMetadataV1, S
 // ── Buffer reading ──
 
 fn read_buffer_pixels(buf: &BufferData) -> Option<WaylandFrame> {
-    let total_size = buf.offset as usize + (buf.stride * buf.height) as usize;
-    if total_size > buf.pool_len || buf.width <= 0 || buf.height <= 0 {
-        return None;
-    }
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            buf.pool_len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            buf.pool_fd.as_raw_fd(),
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
+    if buf.mmap.ptr.is_null() || buf.width <= 0 || buf.height <= 0 {
         return None;
     }
     let pixel_offset = buf.offset as usize;
     let pixel_len = (buf.stride * buf.height) as usize;
-    let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(pixel_offset), pixel_len) }
-        .to_vec();
-    unsafe {
-        libc::munmap(ptr, buf.pool_len);
+    if pixel_offset + pixel_len > buf.mmap.len {
+        return None;
     }
+
+    // Read directly from persistent mmap — zero syscall overhead
+    let data =
+        unsafe { std::slice::from_raw_parts(buf.mmap.ptr.add(pixel_offset), pixel_len) }.to_vec();
+
     Some(WaylandFrame {
         width: buf.width as u32,
         height: buf.height as u32,
