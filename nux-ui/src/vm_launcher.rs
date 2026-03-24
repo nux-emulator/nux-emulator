@@ -528,6 +528,62 @@ impl VmLauncher {
         Ok(())
     }
 
+    /// Set up ARM64 native bridge (binfmt_misc) after boot.
+    /// SELinux blocks the init.rc trigger, so we:
+    /// 1. Set SELinux permissive
+    /// 2. Set blocked properties
+    /// 3. Mount binfmt_misc and register entries
+    /// 4. Restart zygote so native bridge reinitializes
+    pub fn setup_arm_translation(&self) -> Result<(), String> {
+        let adb = |args: &[&str]| -> Result<std::process::Output, String> {
+            Command::new("adb")
+                .args(["-s", "127.0.0.1:6520", "shell"])
+                .args(args)
+                .output()
+                .map_err(|e| format!("adb: {e}"))
+        };
+
+        // Set SELinux permissive so ndk_translation can set its properties
+        let _ = adb(&["su", "0", "setenforce", "0"]);
+
+        // Set the properties that SELinux blocked during init
+        let _ = adb(&["su", "0", "setprop", "ro.ndk_translation.version", "0.2.3"]);
+        let _ = adb(&["su", "0", "setprop", "ro.enable.native.bridge.exec", "1"]);
+
+        // Mount binfmt_misc and register ARM translation entries
+        let _ = adb(&[
+            "su",
+            "0",
+            "mount",
+            "-t",
+            "binfmt_misc",
+            "binfmt_misc",
+            "/proc/sys/fs/binfmt_misc",
+        ]);
+        for entry in &["arm64_exe", "arm64_dyn", "arm_exe", "arm_dyn"] {
+            let src = format!("/vendor/etc/binfmt_misc/{entry}");
+            let _ = adb(&["su", "0", "cp", &src, "/proc/sys/fs/binfmt_misc/register"]);
+        }
+
+        // Restart zygote so native bridge reinitializes with correct properties
+        log::info!("vm: restarting zygote for native bridge initialization...");
+        let _ = adb(&["su", "0", "setprop", "ctl.restart", "zygote"]);
+
+        // Wait for framework to come back
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if let Ok(out) = adb(&["getprop", "sys.boot_completed"]) {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                if s == "1" {
+                    break;
+                }
+            }
+        }
+
+        log::info!("vm: ARM64 native bridge initialized (SELinux permissive + zygote restart)");
+        Ok(())
+    }
+
     /// Check if ADB is connected and boot is complete.
     pub fn check_boot_status(&self) -> BootStatus {
         let connect = Command::new("adb")

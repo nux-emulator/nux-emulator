@@ -23,7 +23,7 @@ use crate::wayland_protocol::{wp_virtio_gpu_metadata_v1, wp_virtio_gpu_surface_m
 
 // ── Public types ──
 
-/// A raw ARGB8888 frame from crosvm.
+/// A raw ARGB8888 frame from crosvm (shm path).
 #[derive(Clone)]
 pub struct WaylandFrame {
     pub width: u32,
@@ -32,10 +32,15 @@ pub struct WaylandFrame {
     pub data: Vec<u8>,
 }
 
+/// Frame types — either shm pixels or dmabuf handle.
+pub enum FrameData {
+    Shm(WaylandFrame),
+    Dmabuf(DmabufFrame),
+}
+
 /// Shared frame slot — compositor writes, UI reads. Only the latest frame matters.
 pub struct FrameSlot {
-    frame: Mutex<Option<WaylandFrame>>,
-    /// Signals that a new frame is available
+    frame: Mutex<Option<FrameData>>,
     new_frame: std::sync::atomic::AtomicBool,
 }
 
@@ -54,14 +59,14 @@ impl FrameSlot {
     }
 
     /// Called by compositor thread — stores the latest frame
-    fn put(&self, frame: WaylandFrame) {
+    fn put(&self, frame: FrameData) {
         *self.frame.lock().unwrap() = Some(frame);
         self.new_frame
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Called by UI thread — takes the latest frame if available
-    pub fn take(&self) -> Option<WaylandFrame> {
+    pub fn take(&self) -> Option<FrameData> {
         if self
             .new_frame
             .swap(false, std::sync::atomic::Ordering::Acquire)
@@ -231,7 +236,38 @@ struct PointerData;
 struct KeyboardData;
 struct TouchData;
 struct DmabufData;
-struct DmabufParamsData;
+
+/// Accumulated DMA-BUF plane info during params.add() calls.
+struct DmabufParamsData {
+    planes: Mutex<Vec<DmabufPlane>>,
+}
+
+struct DmabufPlane {
+    fd: OwnedFd,
+    offset: u32,
+    stride: u32,
+}
+
+/// A DMA-BUF backed buffer.
+struct DmabufBufferData {
+    planes: Vec<DmabufPlane>,
+    width: i32,
+    height: i32,
+    fourcc: u32,
+    modifier: u64,
+}
+
+/// DMA-BUF frame metadata sent to UI thread (no pixel copy needed).
+#[derive(Clone)]
+pub struct DmabufFrame {
+    pub fd: std::os::fd::RawFd,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub offset: u32,
+    pub fourcc: u32,
+    pub modifier: u64,
+}
 struct XdgWmBaseData;
 struct XdgSurfaceData;
 struct XdgToplevelData;
@@ -387,9 +423,22 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for Compositor {
                 }
                 let buf_ref = sd.buffer.lock().unwrap();
                 if let Some(ref buffer) = *buf_ref {
-                    if let Some(buf_data) = buffer.data::<BufferData>() {
+                    // Try dmabuf first, then shm
+                    if let Some(dmabuf) = buffer.data::<DmabufBufferData>() {
+                        if let Some(plane) = dmabuf.planes.first() {
+                            state.frame_slot.put(FrameData::Dmabuf(DmabufFrame {
+                                fd: plane.fd.as_raw_fd(),
+                                width: dmabuf.width as u32,
+                                height: dmabuf.height as u32,
+                                stride: plane.stride,
+                                offset: plane.offset,
+                                fourcc: dmabuf.fourcc,
+                                modifier: dmabuf.modifier,
+                            }));
+                        }
+                    } else if let Some(buf_data) = buffer.data::<BufferData>() {
                         if let Some(frame) = read_buffer_pixels(buf_data) {
-                            state.frame_slot.put(frame);
+                            state.frame_slot.put(FrameData::Shm(frame));
                         }
                     }
                     buffer.release();
@@ -653,7 +702,12 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, DmabufData> for Compositor 
         di: &mut DataInit<'_, Self>,
     ) {
         if let zwp_linux_dmabuf_v1::Request::CreateParams { params_id } = req {
-            di.init(params_id, DmabufParamsData);
+            di.init(
+                params_id,
+                DmabufParamsData {
+                    planes: Mutex::new(Vec::new()),
+                },
+            );
         }
     }
 }
@@ -664,18 +718,79 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
         _: &Client,
         r: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         req: zwp_linux_buffer_params_v1::Request,
-        _: &DmabufParamsData,
+        data: &DmabufParamsData,
         _: &DisplayHandle,
-        _: &mut DataInit<'_, Self>,
+        di: &mut DataInit<'_, Self>,
     ) {
         match req {
-            zwp_linux_buffer_params_v1::Request::Add { .. } => {}
-            zwp_linux_buffer_params_v1::Request::Create { .. }
-            | zwp_linux_buffer_params_v1::Request::CreateImmed { .. } => {
+            zwp_linux_buffer_params_v1::Request::Add {
+                fd,
+                plane_idx: _,
+                offset,
+                stride,
+                modifier_hi: _,
+                modifier_lo: _,
+            } => {
+                let owned =
+                    unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(fd.as_raw_fd()).unwrap()) };
+                data.planes.lock().unwrap().push(DmabufPlane {
+                    fd: owned,
+                    offset,
+                    stride,
+                });
+            }
+            zwp_linux_buffer_params_v1::Request::CreateImmed {
+                buffer_id,
+                width,
+                height,
+                format,
+                flags: _,
+            } => {
+                let planes = std::mem::take(&mut *data.planes.lock().unwrap());
+                if planes.is_empty() {
+                    r.failed();
+                    return;
+                }
+                log::info!(
+                    "wayland: dmabuf buffer created {width}x{height} fourcc=0x{format:08x} planes={}",
+                    planes.len()
+                );
+                di.init(
+                    buffer_id,
+                    DmabufBufferData {
+                        planes,
+                        width,
+                        height,
+                        fourcc: format,
+                        modifier: 0, // TODO: combine modifier_hi/lo from Add
+                    },
+                );
+            }
+            zwp_linux_buffer_params_v1::Request::Create {
+                width,
+                height,
+                format,
+                flags: _,
+            } => {
+                // Create is async — for now just fail, CreateImmed is preferred
+                log::warn!("wayland: dmabuf Create (async) not supported, use CreateImmed");
                 r.failed();
             }
             _ => {}
         }
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, DmabufBufferData> for Compositor {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wl_buffer::WlBuffer,
+        _: wl_buffer::Request,
+        _: &DmabufBufferData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
     }
 }
 

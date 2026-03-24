@@ -15,7 +15,7 @@ use std::sync::{
 };
 
 use crate::scrcpy::control::ControlSocket;
-use crate::wayland_compositor::WaylandFrame;
+use crate::wayland_compositor::{DmabufFrame, FrameData, WaylandFrame};
 
 /// Handle to the running display stream.
 pub struct ScrcpyHandle {
@@ -106,20 +106,31 @@ pub fn start_wayland_display(
     let vh2 = video_height.clone();
 
     picture.add_tick_callback(move |pic, _clock| {
-        if let Some(frame) = frame_slot.take() {
+        if let Some(frame_data) = frame_slot.take() {
             rc2.set(rc2.get() + 1);
-            vw2.store(frame.width, Ordering::Relaxed);
-            vh2.store(frame.height, Ordering::Relaxed);
 
-            let bytes = glib::Bytes::from_owned(frame.data);
-            let texture = gdk::MemoryTexture::new(
-                frame.width as i32,
-                frame.height as i32,
-                gdk::MemoryFormat::R8g8b8a8Premultiplied,
-                &bytes,
-                frame.stride as usize,
-            );
-            pic.set_paintable(Some(&texture));
+            match frame_data {
+                FrameData::Dmabuf(dmabuf) => {
+                    vw2.store(dmabuf.width, Ordering::Relaxed);
+                    vh2.store(dmabuf.height, Ordering::Relaxed);
+                    if let Some(texture) = create_dmabuf_texture(pic, &dmabuf) {
+                        pic.set_paintable(Some(&texture));
+                    }
+                }
+                FrameData::Shm(frame) => {
+                    vw2.store(frame.width, Ordering::Relaxed);
+                    vh2.store(frame.height, Ordering::Relaxed);
+                    let bytes = glib::Bytes::from_owned(frame.data);
+                    let texture = gdk::MemoryTexture::new(
+                        frame.width as i32,
+                        frame.height as i32,
+                        gdk::MemoryFormat::R8g8b8a8Premultiplied,
+                        &bytes,
+                        frame.stride as usize,
+                    );
+                    pic.set_paintable(Some(&texture));
+                }
+            }
         }
         glib::ControlFlow::Continue
     });
@@ -424,4 +435,111 @@ fn gdk_modifier_to_android(modifier: gdk::ModifierType) -> u32 {
         meta |= 0x02;
     }
     meta
+}
+
+/// Create a GdkDmabufTexture from a DMA-BUF fd via C FFI.
+/// This is zero-copy — the GPU reads the buffer directly.
+fn create_dmabuf_texture(pic: &gtk::Picture, dmabuf: &DmabufFrame) -> Option<gdk::Texture> {
+    use glib::translate::*;
+
+    unsafe {
+        // GdkDmabufTextureBuilder FFI
+        unsafe extern "C" {
+            fn gdk_dmabuf_texture_builder_new() -> *mut glib::gobject_ffi::GObject;
+            fn gdk_dmabuf_texture_builder_set_display(
+                builder: *mut glib::gobject_ffi::GObject,
+                display: *mut glib::gobject_ffi::GObject,
+            );
+            fn gdk_dmabuf_texture_builder_set_width(
+                builder: *mut glib::gobject_ffi::GObject,
+                width: u32,
+            );
+            fn gdk_dmabuf_texture_builder_set_height(
+                builder: *mut glib::gobject_ffi::GObject,
+                height: u32,
+            );
+            fn gdk_dmabuf_texture_builder_set_fourcc(
+                builder: *mut glib::gobject_ffi::GObject,
+                fourcc: u32,
+            );
+            fn gdk_dmabuf_texture_builder_set_modifier(
+                builder: *mut glib::gobject_ffi::GObject,
+                modifier: u64,
+            );
+            fn gdk_dmabuf_texture_builder_set_n_planes(
+                builder: *mut glib::gobject_ffi::GObject,
+                n_planes: u32,
+            );
+            fn gdk_dmabuf_texture_builder_set_fd(
+                builder: *mut glib::gobject_ffi::GObject,
+                plane: u32,
+                fd: i32,
+            );
+            fn gdk_dmabuf_texture_builder_set_stride(
+                builder: *mut glib::gobject_ffi::GObject,
+                plane: u32,
+                stride: u32,
+            );
+            fn gdk_dmabuf_texture_builder_set_offset(
+                builder: *mut glib::gobject_ffi::GObject,
+                plane: u32,
+                offset: u32,
+            );
+            fn gdk_dmabuf_texture_builder_set_premultiplied(
+                builder: *mut glib::gobject_ffi::GObject,
+                premultiplied: i32,
+            );
+            fn gdk_dmabuf_texture_builder_build(
+                builder: *mut glib::gobject_ffi::GObject,
+                destroy: *const std::ffi::c_void,
+                data: *mut std::ffi::c_void,
+                error: *mut *mut glib::ffi::GError,
+            ) -> *mut glib::gobject_ffi::GObject;
+            fn g_object_unref(obj: *mut glib::gobject_ffi::GObject);
+        }
+
+        let builder = gdk_dmabuf_texture_builder_new();
+        if builder.is_null() {
+            return None;
+        }
+
+        let display: gdk::Display = pic.display();
+        let display_ptr =
+            glib::translate::ToGlibPtr::<*mut gdk::ffi::GdkDisplay>::to_glib_none(&display)
+                .0
+                .cast::<glib::gobject_ffi::GObject>();
+
+        gdk_dmabuf_texture_builder_set_display(builder, display_ptr);
+        gdk_dmabuf_texture_builder_set_width(builder, dmabuf.width);
+        gdk_dmabuf_texture_builder_set_height(builder, dmabuf.height);
+        gdk_dmabuf_texture_builder_set_fourcc(builder, dmabuf.fourcc);
+        gdk_dmabuf_texture_builder_set_modifier(builder, dmabuf.modifier);
+        gdk_dmabuf_texture_builder_set_premultiplied(builder, 1);
+        gdk_dmabuf_texture_builder_set_n_planes(builder, 1);
+        gdk_dmabuf_texture_builder_set_fd(builder, 0, dmabuf.fd);
+        gdk_dmabuf_texture_builder_set_stride(builder, 0, dmabuf.stride);
+        gdk_dmabuf_texture_builder_set_offset(builder, 0, dmabuf.offset);
+
+        let mut error: *mut glib::ffi::GError = std::ptr::null_mut();
+        let texture = gdk_dmabuf_texture_builder_build(
+            builder,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut error,
+        );
+
+        g_object_unref(builder);
+
+        if texture.is_null() {
+            if !error.is_null() {
+                let msg = std::ffi::CStr::from_ptr((*error).message).to_string_lossy();
+                log::error!("dmabuf texture build failed: {msg}");
+                glib::ffi::g_error_free(error);
+            }
+            return None;
+        }
+
+        // Transfer ownership to gdk::Texture
+        Some(from_glib_full(texture.cast::<gdk::ffi::GdkTexture>()))
+    }
 }

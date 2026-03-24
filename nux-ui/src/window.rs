@@ -633,6 +633,15 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
+                    // Set up ARM translation first (restarts zygote, kills scrcpy)
+                    // Must happen BEFORE connecting scrcpy control socket
+                    {
+                        let launcher2 = launcher.clone();
+                        let _ = launcher2.enable_wifi();
+                        let _ = launcher2.setup_arm_translation();
+                    }
+
+                    // Now start display + scrcpy control (after zygote restart)
                     // Use Wayland compositor for native display
                     let display_handle = if let Some(frame_slot) =
                         nux_clone.state.wayland_frame_slot.borrow_mut().take()
@@ -662,12 +671,6 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         return glib::ControlFlow::Continue;
                     };
                     *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
-
-                    // Enable WiFi in background
-                    let launcher2 = launcher.clone();
-                    std::thread::spawn(move || {
-                        let _ = launcher2.enable_wifi();
-                    });
                 }
                 glib::ControlFlow::Continue
             }
