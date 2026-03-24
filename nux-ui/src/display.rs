@@ -120,7 +120,10 @@ pub fn start_wayland_display(
     let vh2 = video_height.clone();
     let gs = gl_state.clone();
 
-    picture.add_tick_callback(move |pic, _clock| {
+    let pic = picture.clone();
+    // Poll at ~120Hz (8ms) to catch every frame from crosvm's 60fps output.
+    // GTK's tick callback is limited to ~30Hz by the desktop compositor.
+    glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
         if let Some(frame_data) = frame_slot.take() {
             rc2.set(rc2.get() + 1);
 
@@ -128,9 +131,8 @@ pub fn start_wayland_display(
                 vw2.store(frame.width, Ordering::Relaxed);
                 vh2.store(frame.height, Ordering::Relaxed);
 
-                // Lazy init GL
                 if gs.borrow().is_none() {
-                    match init_gl_state(pic) {
+                    match init_gl_state(&pic) {
                         Ok(state) => {
                             log::info!("display: GL texture renderer initialized");
                             *gs.borrow_mut() = Some(state);
@@ -143,7 +145,7 @@ pub fn start_wayland_display(
                 }
 
                 if let Some(state) = gs.borrow_mut().as_mut() {
-                    upload_and_present(state, pic, &frame);
+                    upload_and_present(state, &pic, &frame);
                 }
             }
         }

@@ -139,6 +139,9 @@ pub struct Compositor {
     serial: u32,
     /// Keep the keymap memfd alive until the compositor is dropped
     _keymap_fd: Option<OwnedFd>,
+    /// Frame production counter
+    commit_count: u64,
+    commit_start: std::time::Instant,
 }
 
 impl Compositor {
@@ -451,6 +454,17 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for Compositor {
                     } else if let Some(buf_data) = buffer.data::<BufferData>() {
                         if let Some(frame) = read_buffer_pixels(buf_data) {
                             state.frame_slot.put(FrameData::Shm(frame));
+                            state.commit_count += 1;
+                            if state.commit_count % 120 == 0 {
+                                let elapsed = state.commit_start.elapsed().as_secs_f64();
+                                let fps = state.commit_count as f64 / elapsed;
+                                log::info!(
+                                    "compositor: {} commits in {:.1}s ({:.1} fps from crosvm)",
+                                    state.commit_count,
+                                    elapsed,
+                                    fps
+                                );
+                            }
                         }
                     }
                     buffer.release();
@@ -954,6 +968,8 @@ pub fn start_compositor_at_path(
         surface: None,
         serial: 0,
         _keymap_fd: None,
+        commit_count: 0,
+        commit_start: std::time::Instant::now(),
     };
 
     log::info!("wayland: compositor listening on {socket_path}");
