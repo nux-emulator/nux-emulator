@@ -79,6 +79,8 @@ pub struct Compositor {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     surface: Option<wl_surface::WlSurface>,
     serial: u32,
+    /// Keep the keymap memfd alive until the compositor is dropped
+    _keymap_fd: Option<OwnedFd>,
 }
 
 impl Compositor {
@@ -145,36 +147,15 @@ struct SurfaceData {
 struct ShmPoolData {
     fd: Arc<OwnedFd>,
     len: usize,
-    /// Persistent mmap pointer — avoids mmap/munmap per frame
-    mmap_ptr: *mut std::ffi::c_void,
 }
-
-// Safety: ShmPoolData is only accessed from the compositor thread
-unsafe impl Send for ShmPoolData {}
-unsafe impl Sync for ShmPoolData {}
-
-impl Drop for ShmPoolData {
-    fn drop(&mut self) {
-        if !self.mmap_ptr.is_null() && self.mmap_ptr != libc::MAP_FAILED {
-            unsafe {
-                libc::munmap(self.mmap_ptr, self.len);
-            }
-        }
-    }
-}
-
 struct BufferData {
-    pool_ptr: *const u8, // Points into the pool's persistent mmap
+    pool_fd: Arc<OwnedFd>,
     pool_len: usize,
     offset: i32,
     width: i32,
     height: i32,
     stride: i32,
 }
-
-// Safety: BufferData is only accessed from the compositor thread
-unsafe impl Send for BufferData {}
-unsafe impl Sync for BufferData {}
 struct RegionData;
 struct MetadataGlobalData;
 struct SurfaceMetadataData {
@@ -400,32 +381,11 @@ impl Dispatch<wl_shm::WlShm, ()> for Compositor {
         if let wl_shm::Request::CreatePool { id, fd, size } = req {
             let raw_fd = fd.as_raw_fd();
             let owned = unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(raw_fd).unwrap()) };
-            let len = size as usize;
-
-            // Persistent mmap — kept alive for the pool's lifetime
-            let mmap_ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    owned.as_raw_fd(),
-                    0,
-                )
-            };
-            if mmap_ptr == libc::MAP_FAILED {
-                log::error!(
-                    "wayland: pool mmap failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-
             di.init(
                 id,
                 ShmPoolData {
                     fd: Arc::new(owned),
-                    len,
-                    mmap_ptr,
+                    len: size as usize,
                 },
             );
         }
@@ -454,7 +414,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for Compositor {
             di.init(
                 id,
                 BufferData {
-                    pool_ptr: data.mmap_ptr.cast::<u8>(),
+                    pool_fd: Arc::clone(&data.fd),
                     pool_len: data.len,
                     offset,
                     width,
@@ -545,6 +505,8 @@ impl Dispatch<wl_seat::WlSeat, SeatData> for Compositor {
                         fd.as_fd(),
                         keymap_bytes.len() as u32,
                     );
+                    // Keep fd alive — dropping it before flush_clients would SEGV
+                    state._keymap_fd = Some(fd);
                 }
                 state.keyboard = Some(keyboard);
                 log::info!("wayland: keyboard created");
@@ -714,16 +676,29 @@ impl Dispatch<wp_virtio_gpu_surface_metadata_v1::WpVirtioGpuSurfaceMetadataV1, S
 
 fn read_buffer_pixels(buf: &BufferData) -> Option<WaylandFrame> {
     let total_size = buf.offset as usize + (buf.stride * buf.height) as usize;
-    if total_size > buf.pool_len || buf.width <= 0 || buf.height <= 0 || buf.pool_ptr.is_null() {
+    if total_size > buf.pool_len || buf.width <= 0 || buf.height <= 0 {
         return None;
     }
-
-    // Read directly from persistent mmap — no mmap/munmap per frame
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            buf.pool_len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            buf.pool_fd.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return None;
+    }
     let pixel_offset = buf.offset as usize;
     let pixel_len = (buf.stride * buf.height) as usize;
-    let data =
-        unsafe { std::slice::from_raw_parts(buf.pool_ptr.add(pixel_offset), pixel_len) }.to_vec();
-
+    let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(pixel_offset), pixel_len) }
+        .to_vec();
+    unsafe {
+        libc::munmap(ptr, buf.pool_len);
+    }
     Some(WaylandFrame {
         width: buf.width as u32,
         height: buf.height as u32,
@@ -777,6 +752,7 @@ pub fn start_compositor_at_path(
         keyboard: None,
         surface: None,
         serial: 0,
+        _keymap_fd: None,
     };
 
     log::info!("wayland: compositor listening on {socket_path}");
