@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::display::ScrcpyHandle;
 use crate::vm_launcher::{VmLaunchConfig, VmLauncher};
-use crate::wayland_compositor::{WaylandFrame, WaylandInput};
+use crate::wayland_compositor::{FrameSlot, WaylandInput};
 
 /// Lightweight shared state for the UI layer.
 #[derive(Debug)]
@@ -26,8 +26,8 @@ pub struct UiState {
     pub launcher: Arc<VmLauncher>,
     /// Display handle.
     pub scrcpy: RefCell<Option<ScrcpyHandle>>,
-    /// Wayland frame receiver (set before VM boot, consumed on boot).
-    pub wayland_frame_rx: RefCell<Option<std::sync::mpsc::Receiver<WaylandFrame>>>,
+    /// Wayland frame slot (set before VM boot, consumed on boot).
+    pub wayland_frame_slot: RefCell<Option<Arc<FrameSlot>>>,
     /// Wayland input handle for sending pointer/keyboard events to crosvm.
     pub wayland_input: RefCell<Option<WaylandInput>>,
 }
@@ -43,7 +43,7 @@ impl Default for UiState {
             pre_fs_height: Cell::new(768),
             launcher: Arc::new(VmLauncher::new(VmLaunchConfig::default())),
             scrcpy: RefCell::new(None),
-            wayland_frame_rx: RefCell::new(None),
+            wayland_frame_slot: RefCell::new(None),
             wayland_input: RefCell::new(None),
         }
     }

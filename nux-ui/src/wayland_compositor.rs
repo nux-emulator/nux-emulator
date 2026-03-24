@@ -32,6 +32,47 @@ pub struct WaylandFrame {
     pub data: Vec<u8>,
 }
 
+/// Shared frame slot — compositor writes, UI reads. Only the latest frame matters.
+pub struct FrameSlot {
+    frame: Mutex<Option<WaylandFrame>>,
+    /// Signals that a new frame is available
+    new_frame: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for FrameSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameSlot").finish()
+    }
+}
+
+impl FrameSlot {
+    pub fn new() -> Self {
+        Self {
+            frame: Mutex::new(None),
+            new_frame: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Called by compositor thread — stores the latest frame
+    fn put(&self, frame: WaylandFrame) {
+        *self.frame.lock().unwrap() = Some(frame);
+        self.new_frame
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Called by UI thread — takes the latest frame if available
+    pub fn take(&self) -> Option<WaylandFrame> {
+        if self
+            .new_frame
+            .swap(false, std::sync::atomic::Ordering::Acquire)
+        {
+            self.frame.lock().unwrap().take()
+        } else {
+            None
+        }
+    }
+}
+
 /// Input events sent from GTK4 UI thread to compositor thread.
 #[allow(dead_code)]
 pub enum InputEvent {
@@ -73,7 +114,7 @@ impl WaylandInput {
 // ── Compositor state ──
 
 pub struct Compositor {
-    frame_tx: mpsc::Sender<WaylandFrame>,
+    frame_slot: Arc<FrameSlot>,
     input_rx: mpsc::Receiver<InputEvent>,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -348,7 +389,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for Compositor {
                 if let Some(ref buffer) = *buf_ref {
                     if let Some(buf_data) = buffer.data::<BufferData>() {
                         if let Some(frame) = read_buffer_pixels(buf_data) {
-                            let _ = state.frame_tx.send(frame);
+                            state.frame_slot.put(frame);
                         }
                     }
                     buffer.release();
@@ -747,13 +788,13 @@ fn read_buffer_pixels(buf: &BufferData) -> Option<WaylandFrame> {
 /// Returns (frame_receiver, input_handle).
 pub fn start_compositor_at_path(
     socket_path: &str,
-) -> Result<(mpsc::Receiver<WaylandFrame>, WaylandInput), String> {
+) -> Result<(Arc<FrameSlot>, WaylandInput), String> {
     let _ = std::fs::remove_file(socket_path);
     if let Some(parent) = std::path::Path::new(socket_path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
-    let (frame_tx, frame_rx) = mpsc::channel();
+    let frame_slot = Arc::new(FrameSlot::new());
     let (input_tx, input_rx) = mpsc::channel();
 
     let mut display = wayland_server::Display::<Compositor>::new()
@@ -780,7 +821,7 @@ pub fn start_compositor_at_path(
         .map_err(|e| format!("set_nonblocking: {e}"))?;
 
     let mut state = Compositor {
-        frame_tx,
+        frame_slot: Arc::clone(&frame_slot),
         input_rx,
         pointer: None,
         keyboard: None,
@@ -813,5 +854,5 @@ pub fn start_compositor_at_path(
     });
 
     let wayland_input = WaylandInput { tx: input_tx };
-    Ok((frame_rx, wayland_input))
+    Ok((frame_slot, wayland_input))
 }

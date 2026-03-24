@@ -269,7 +269,7 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             let launcher = nux.state.launcher.clone();
             let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
             let (wl_tx, wl_rx) = std::sync::mpsc::channel::<(
-                std::sync::mpsc::Receiver<crate::wayland_compositor::WaylandFrame>,
+                std::sync::Arc<crate::wayland_compositor::FrameSlot>,
                 crate::wayland_compositor::WaylandInput,
             )>();
 
@@ -336,8 +336,8 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             let nux_clone = nux.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
                 // Check if Wayland compositor is ready
-                if let Ok((frame_rx, wayland_input)) = wl_rx.try_recv() {
-                    *nux_clone.state.wayland_frame_rx.borrow_mut() = Some(frame_rx);
+                if let Ok((frame_slot, wayland_input)) = wl_rx.try_recv() {
+                    *nux_clone.state.wayland_frame_slot.borrow_mut() = Some(frame_slot);
                     *nux_clone.state.wayland_input.borrow_mut() = Some(wayland_input);
                 }
 
@@ -634,8 +634,8 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .add_toast(adw::Toast::new("Android booted!"));
 
                     // Use Wayland compositor for native display
-                    let display_handle = if let Some(frame_rx) =
-                        nux_clone.state.wayland_frame_rx.borrow_mut().take()
+                    let display_handle = if let Some(frame_slot) =
+                        nux_clone.state.wayland_frame_slot.borrow_mut().take()
                     {
                         let wayland_input = nux_clone.state.wayland_input.borrow_mut().take();
                         if let Some(wl_input) = wayland_input {
@@ -647,7 +647,7 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                                 &nux_clone.display_widget,
                                 &nux_clone.input_area,
                                 &nux_clone.window,
-                                frame_rx,
+                                frame_slot,
                                 wl_input,
                             )
                         } else {

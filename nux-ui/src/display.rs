@@ -81,12 +81,12 @@ pub fn build_display() -> (gtk::Overlay, gtk::DrawingArea) {
     (overlay, input_area)
 }
 
-/// Start display from Wayland compositor frame receiver.
+/// Start display from Wayland compositor frame slot.
 pub fn start_wayland_display(
     overlay: &gtk::Overlay,
     input_area: &gtk::DrawingArea,
     _window: &adw::ApplicationWindow,
-    frame_rx: std::sync::mpsc::Receiver<WaylandFrame>,
+    frame_slot: std::sync::Arc<crate::wayland_compositor::FrameSlot>,
     _wayland_input: crate::wayland_compositor::WaylandInput,
 ) -> ScrcpyHandle {
     let running = Arc::new(AtomicBool::new(true));
@@ -99,31 +99,19 @@ pub fn start_wayland_display(
         .and_then(|w| w.downcast::<gtk::Picture>().ok())
         .expect("Overlay child should be a Picture");
 
-    // Render on frame clock — use MemoryTexture with correct pixel format
+    // Render on frame clock — take latest frame from shared slot
     let render_count = Rc::new(std::cell::Cell::new(0u64));
-    let drop_count = Rc::new(std::cell::Cell::new(0u64));
     let rc2 = render_count.clone();
-    let dc2 = drop_count.clone();
     let vw2 = video_width.clone();
     let vh2 = video_height.clone();
 
     picture.add_tick_callback(move |pic, _clock| {
-        let mut latest = None;
-        let mut dropped = 0u64;
-        while let Ok(frame) = frame_rx.try_recv() {
-            if latest.is_some() {
-                dropped += 1;
-            }
-            latest = Some(frame);
-        }
-        dc2.set(dc2.get() + dropped);
-        if let Some(frame) = latest {
+        if let Some(frame) = frame_slot.take() {
             rc2.set(rc2.get() + 1);
             vw2.store(frame.width, Ordering::Relaxed);
             vh2.store(frame.height, Ordering::Relaxed);
 
             let bytes = glib::Bytes::from_owned(frame.data);
-            // crosvm sends BGRA (B8G8R8A8) via wl_shm ARGB8888
             let texture = gdk::MemoryTexture::new(
                 frame.width as i32,
                 frame.height as i32,
@@ -138,18 +126,15 @@ pub fn start_wayland_display(
 
     // FPS logger
     let rc3 = render_count.clone();
-    let dc3 = drop_count.clone();
     glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
         let rendered = rc3.get();
-        let dropped = dc3.get();
         if rendered > 0 {
             log::info!(
-                "render: {rendered} frames rendered, {dropped} dropped (render rate ~{}/s)",
+                "render: {rendered} frames rendered (render rate ~{}/s)",
                 rendered / 2
             );
         }
         rc3.set(0);
-        dc3.set(0);
         glib::ControlFlow::Continue
     });
 
