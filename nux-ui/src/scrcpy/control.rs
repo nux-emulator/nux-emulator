@@ -1,8 +1,9 @@
-//! Scrcpy control protocol — sends touch/key events over a persistent socket.
+//! Scrcpy control protocol — sends touch/key/text events over a persistent socket.
 //!
 //! Binary protocol (big-endian):
-//! - Touch: type(1)=2 + action(1) + pointerId(8) + x(4) + y(4) + w(2) + h(2) + pressure(2) + actionButton(4) + buttons(4)
 //! - Key:   type(1)=0 + action(1) + keycode(4) + repeat(4) + metaState(4)
+//! - Text:  type(1)=1 + length(4) + text(variable UTF-8)
+//! - Touch: type(1)=2 + action(1) + pointerId(8) + x(4) + y(4) + w(2) + h(2) + pressure(2) + actionButton(4) + buttons(4)
 //! - Back:  type(1)=4 + action(1)
 
 use std::io::Write;
@@ -10,6 +11,7 @@ use std::net::TcpStream;
 
 // Control message types
 const TYPE_INJECT_KEYCODE: u8 = 0;
+const TYPE_INJECT_TEXT: u8 = 1;
 const TYPE_INJECT_TOUCH: u8 = 2;
 const TYPE_BACK_OR_SCREEN_ON: u8 = 4;
 
@@ -119,6 +121,35 @@ impl ControlSocket {
         let _ = self.stream.write_all(&buf);
         let buf = [TYPE_BACK_OR_SCREEN_ON, AKEY_ACTION_UP];
         let _ = self.stream.write_all(&buf);
+    }
+
+    /// Inject text directly (for printable characters).
+    /// Uses TYPE_INJECT_TEXT which handles IME input correctly.
+    pub fn inject_text(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let len = bytes.len() as u32;
+        let mut buf = Vec::with_capacity(5 + bytes.len());
+        buf.push(TYPE_INJECT_TEXT);
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(bytes);
+        let _ = self.stream.write_all(&buf);
+    }
+
+    /// Send a key event with meta state (shift, ctrl, alt).
+    pub fn key_event_meta(&mut self, action: u8, keycode: u32, meta_state: u32) {
+        let mut buf = [0u8; 14];
+        buf[0] = TYPE_INJECT_KEYCODE;
+        buf[1] = action;
+        buf[2..6].copy_from_slice(&keycode.to_be_bytes());
+        // repeat (4 bytes) = 0
+        buf[10..14].copy_from_slice(&meta_state.to_be_bytes());
+        let _ = self.stream.write_all(&buf);
+    }
+
+    /// Send a key with meta state (down + up).
+    pub fn key_meta(&mut self, keycode: u32, meta_state: u32) {
+        self.key_event_meta(AKEY_ACTION_DOWN, keycode, meta_state);
+        self.key_event_meta(AKEY_ACTION_UP, keycode, meta_state);
     }
 }
 

@@ -200,7 +200,7 @@ fn check_cpu_virtualization() -> VmResult<String> {
 
         if is_intel {
             // Check VT-x: CPUID.1:ECX bit 5
-            let result = unsafe { core::arch::x86_64::__cpuid(1) };
+            let result = core::arch::x86_64::__cpuid(1);
             if result.ecx & (1 << 5) == 0 {
                 return Err(VmError::CpuFeatureMissing(
                     "Intel VT-x not supported by this CPU".to_owned(),
@@ -209,7 +209,7 @@ fn check_cpu_virtualization() -> VmResult<String> {
             Ok("Intel VT-x supported".to_owned())
         } else if is_amd {
             // Check AMD-V: CPUID.8000_0001:ECX bit 2
-            let result = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
+            let result = core::arch::x86_64::__cpuid(0x8000_0001);
             if result.ecx & (1 << 2) == 0 {
                 return Err(VmError::CpuFeatureMissing(
                     "AMD-V (SVM) not supported by this CPU".to_owned(),
@@ -238,13 +238,13 @@ fn has_extended_page_tables() -> bool {
         let vendor = get_cpu_vendor();
         if vendor == "GenuineIntel" {
             // Heuristic: modern Intel CPUs (Nehalem+) all support EPT.
-            let result = unsafe { core::arch::x86_64::__cpuid(1) };
+            let result = core::arch::x86_64::__cpuid(1);
             let family = ((result.eax >> 8) & 0xF) + ((result.eax >> 20) & 0xFF);
             let model = ((result.eax >> 4) & 0xF) | (((result.eax >> 16) & 0xF) << 4);
             family >= 6 && model >= 26
         } else if vendor == "AuthenticAMD" {
             // NPT: CPUID.8000_000A:EDX bit 0
-            let result = unsafe { core::arch::x86_64::__cpuid(0x8000_000A) };
+            let result = core::arch::x86_64::__cpuid(0x8000_000A);
             result.edx & 1 != 0
         } else {
             false
@@ -260,7 +260,7 @@ fn has_extended_page_tables() -> bool {
 /// Get CPU vendor string from CPUID leaf 0.
 #[cfg(target_arch = "x86_64")]
 fn get_cpu_vendor() -> String {
-    let result = unsafe { core::arch::x86_64::__cpuid(0) };
+    let result = core::arch::x86_64::__cpuid(0);
     let vendor_bytes: [u8; 12] = [
         result.ebx.to_le_bytes(),
         result.edx.to_le_bytes(),

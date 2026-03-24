@@ -268,15 +268,76 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
 
             let launcher = nux.state.launcher.clone();
             let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+            let (wl_tx, wl_rx) = std::sync::mpsc::channel::<(
+                std::sync::mpsc::Receiver<crate::wayland_compositor::WaylandFrame>,
+                crate::wayland_compositor::WaylandInput,
+            )>();
 
             std::thread::spawn(move || {
+                let frames_sock = "/tmp/cf_avd_0/cvd-1/internal/frames.sock";
+
+                // Start launch_cvd normally — don't interfere with socket creation
                 let result = launcher.start();
+
+                // After launch_cvd starts, watch for crosvm process.
+                // Crosvm takes ~2s to init gfxstream before connecting to Wayland.
+                // In that window: kill webRTC, replace socket with ours.
+                if result.is_ok() {
+                    // Wait for crosvm to appear (up to 60s)
+                    let mut found = false;
+                    for _ in 0..600 {
+                        let out = std::process::Command::new("pgrep")
+                            .args(["-f", "crosvm.*crosvm_control"])
+                            .output();
+                        if let Ok(o) = out {
+                            if o.status.success() && !o.stdout.is_empty() {
+                                found = true;
+                                break;
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+
+                    if found {
+                        log::info!("vm: crosvm detected, swapping Wayland socket");
+
+                        // Kill webRTC immediately (it holds the old socket fd)
+                        let _ = std::process::Command::new("sudo")
+                            .args(["pkill", "-9", "-f", "webRTC"])
+                            .output();
+
+                        // Remove the old socket and bind ours
+                        let _ = std::process::Command::new("sudo")
+                            .args(["rm", "-f", frames_sock])
+                            .output();
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+
+                        match crate::wayland_compositor::start_compositor_at_path(frames_sock) {
+                            Ok((frame_rx, wayland_input)) => {
+                                log::info!("vm: Wayland compositor bound at {frames_sock}");
+                                let _ = wl_tx.send((frame_rx, wayland_input));
+                            }
+                            Err(e) => {
+                                log::error!("vm: Wayland compositor failed: {e}");
+                            }
+                        }
+                    } else {
+                        log::error!("vm: crosvm not detected after 60s");
+                    }
+                }
+
                 let _ = tx.send(result);
             });
 
             // Poll for result on UI thread
             let nux_clone = nux.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                // Check if Wayland compositor is ready
+                if let Ok((frame_rx, wayland_input)) = wl_rx.try_recv() {
+                    *nux_clone.state.wayland_frame_rx.borrow_mut() = Some(frame_rx);
+                    *nux_clone.state.wayland_input.borrow_mut() = Some(wayland_input);
+                }
+
                 match rx.try_recv() {
                     Ok(Ok(())) => {
                         nux_clone.state.vm_running.set(true);
@@ -540,13 +601,35 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
-                    // Start scrcpy embedded display
-                    let scrcpy_handle = display::start_scrcpy(
-                        &nux_clone.display_widget,
-                        &nux_clone.input_area,
-                        &nux_clone.window,
-                    );
-                    *nux_clone.state.scrcpy.borrow_mut() = Some(scrcpy_handle);
+                    // Use Wayland compositor for native display
+                    let display_handle = if let Some(frame_rx) =
+                        nux_clone.state.wayland_frame_rx.borrow_mut().take()
+                    {
+                        let wayland_input = nux_clone.state.wayland_input.borrow_mut().take();
+                        if let Some(wl_input) = wayland_input {
+                            log::info!("display: using native Wayland compositor");
+                            nux_clone
+                                .toast_overlay
+                                .add_toast(adw::Toast::new("Native display connected"));
+                            display::start_wayland_display(
+                                &nux_clone.display_widget,
+                                &nux_clone.input_area,
+                                &nux_clone.window,
+                                frame_rx,
+                                wl_input,
+                            )
+                        } else {
+                            log::error!("display: no Wayland input handle");
+                            return glib::ControlFlow::Continue;
+                        }
+                    } else {
+                        log::error!("display: no Wayland frame receiver available");
+                        nux_clone
+                            .toast_overlay
+                            .add_toast(adw::Toast::new("Display connection failed"));
+                        return glib::ControlFlow::Continue;
+                    };
+                    *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
 
                     // Enable WiFi in background
                     let launcher2 = launcher.clone();

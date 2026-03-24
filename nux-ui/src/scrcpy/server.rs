@@ -2,7 +2,7 @@
 //!
 //! Uses `adb forward` — the server listens on the device,
 //! we connect from the host. This is how the real scrcpy client works.
-//! With `send_frame_meta=false`, the stream is raw H.264 Annex B.
+//! With `send_frame_meta=true`, each frame has a 12-byte header (PTS + size).
 
 use std::io::Read;
 use std::net::TcpStream;
@@ -14,9 +14,10 @@ const DEVICE_SERVER_PATH: &str = "/data/local/tmp/scrcpy-server.jar";
 const ADB_SERIAL: &str = "127.0.0.1:6520";
 const SCRCPY_VERSION: &str = "3.3.4";
 
-/// Active scrcpy connection with video stream.
+/// Active scrcpy connection with video + control streams.
 pub struct ScrcpyConnection {
     pub video_stream: TcpStream,
+    pub control_stream: TcpStream,
     pub device_name: String,
     _server_process: Child,
     local_port: u16,
@@ -24,30 +25,49 @@ pub struct ScrcpyConnection {
 
 impl ScrcpyConnection {
     /// Establish a scrcpy connection to the device.
+    /// Matches the exact flow proven by the Python test:
+    /// 1. Connect video socket
+    /// 2. Connect control socket (immediately, same port)
+    /// 3. Read 1-byte status + 64-byte device name from video socket
     pub fn connect(max_size: u16, bit_rate: u32) -> Result<Self, String> {
-        // 1. Push server
         log::info!("scrcpy: pushing server...");
         push_server()?;
 
-        // 2. Set up forward tunnel
         let local_port = 27183u16;
         log::info!("scrcpy: setting up forward tunnel on port {local_port}...");
         setup_forward(local_port)?;
 
-        // 3. Start server (control=false, video only)
         log::info!("scrcpy: starting server...");
         let server_process = start_server(local_port, max_size, bit_rate)?;
 
-        // 4. Connect video socket
-        log::info!("scrcpy: connecting video stream...");
-        let video_stream = connect_with_retry(local_port, 30, true)?;
+        // Wait for server to start
+        std::thread::sleep(Duration::from_secs(3));
 
-        // 5. Read status + device name
+        // Connect video socket (first connection)
+        log::info!("scrcpy: connecting video socket...");
+        let video_stream = TcpStream::connect(format!("127.0.0.1:{local_port}"))
+            .map_err(|e| format!("Video connect: {e}"))?;
+        video_stream.set_nodelay(true).ok();
+        video_stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
+        log::info!("scrcpy: video socket connected");
+
+        // Small delay then connect control socket (second connection)
+        std::thread::sleep(Duration::from_millis(500));
+        log::info!("scrcpy: connecting control socket...");
+        let control_stream = TcpStream::connect(format!("127.0.0.1:{local_port}"))
+            .map_err(|e| format!("Control connect: {e}"))?;
+        control_stream.set_nodelay(true).ok();
+        log::info!("scrcpy: control socket connected");
+
+        // Now read status + device name from video socket
         let device_name = read_device_name(&video_stream)?;
         log::info!("scrcpy: connected to device: {device_name}");
 
         Ok(Self {
             video_stream,
+            control_stream,
             device_name,
             _server_process: server_process,
             local_port,
@@ -115,13 +135,13 @@ fn setup_forward(local_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-fn start_server(local_port: u16, max_size: u16, bit_rate: u32) -> Result<Child, String> {
+fn start_server(_local_port: u16, max_size: u16, bit_rate: u32) -> Result<Child, String> {
     let cmd = format!(
         "CLASSPATH={DEVICE_SERVER_PATH} app_process / com.genymobile.scrcpy.Server \
          {SCRCPY_VERSION} \
          tunnel_forward=true \
          audio=false \
-         control=false \
+         control=true \
          cleanup=false \
          max_size={max_size} \
          video_bit_rate={bit_rate} \
@@ -136,32 +156,6 @@ fn start_server(local_port: u16, max_size: u16, bit_rate: u32) -> Result<Child, 
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Start server: {e}"))
-}
-
-fn connect_with_retry(
-    port: u16,
-    max_attempts: u32,
-    initial_delay: bool,
-) -> Result<TcpStream, String> {
-    if initial_delay {
-        // Give server time to start listening
-        std::thread::sleep(Duration::from_secs(2));
-    }
-
-    for attempt in 1..=max_attempts {
-        match TcpStream::connect(format!("127.0.0.1:{port}")) {
-            Ok(stream) => {
-                stream.set_nodelay(true).ok();
-                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-                log::info!("scrcpy: connected on attempt {attempt}");
-                return Ok(stream);
-            }
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
-    Err(format!("Failed to connect after {max_attempts} attempts"))
 }
 
 fn read_device_name(stream: &TcpStream) -> Result<String, String> {

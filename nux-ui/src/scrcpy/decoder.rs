@@ -1,26 +1,31 @@
-//! FFmpeg H.264 decoder — decodes raw H.264 Annex B stream into RGB frames.
+//! FFmpeg H.264 decoder — low-latency decoding of raw Annex B stream into RGB frames.
+//!
+//! Uses a simple Annex B start code scanner to split raw TCP chunks into
+//! complete NAL units before feeding them to FFmpeg's decoder.
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::codec;
 use ffmpeg_next::format::Pixel;
 use ffmpeg_next::software::scaling;
 
-/// Decoded RGB frame ready for rendering.
+/// Decoded BGRA frame ready for cairo rendering.
 #[derive(Clone)]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>, // RGB24
+    pub data: Vec<u8>, // BGRA32 (cairo native format)
     pub stride: usize,
 }
 
-/// H.264 decoder with proper access unit splitting.
+/// H.264 stream decoder with Annex B NAL accumulator.
 pub struct H264Decoder {
     decoder: codec::decoder::Video,
     scaler: Option<scaling::Context>,
     last_width: u32,
     last_height: u32,
-    buffer: Vec<u8>,
+    buf: Vec<u8>,
+    positions: Vec<usize>,
+    seen_sps: bool,
 }
 
 impl H264Decoder {
@@ -31,8 +36,9 @@ impl H264Decoder {
             .ok_or_else(|| "H.264 codec not found".to_owned())?;
 
         let mut context = codec::Context::new_with_codec(codec);
+
         context.set_threading(codec::threading::Config {
-            kind: codec::threading::Type::Frame,
+            kind: codec::threading::Type::Slice,
             count: 4,
         });
 
@@ -46,21 +52,57 @@ impl H264Decoder {
             scaler: None,
             last_width: 0,
             last_height: 0,
-            buffer: Vec::with_capacity(256 * 1024),
+            buf: Vec::with_capacity(256 * 1024),
+            positions: Vec::with_capacity(128),
+            seen_sps: false,
         })
     }
 
-    /// Feed raw H.264 bytes, split into access units, decode, return frames.
-    pub fn decode_chunk(&mut self, data: &[u8]) -> Vec<DecodedFrame> {
-        self.buffer.extend_from_slice(data);
+    /// Feed raw H.264 Annex B data (arbitrary TCP chunk).
+    pub fn feed_raw(&mut self, data: &[u8]) -> Vec<DecodedFrame> {
+        self.buf.extend_from_slice(data);
 
         let mut frames = Vec::new();
 
-        // Split on access unit boundaries and decode each
-        while let Some((au, rest)) = split_access_unit(&self.buffer) {
-            self.buffer = rest;
+        self.positions.clear();
+        find_start_codes_into(&self.buf, &mut self.positions);
 
-            let packet = codec::packet::Packet::copy(&au);
+        if self.positions.len() < 2 {
+            return frames;
+        }
+
+        if !self.seen_sps {
+            let mut sps_idx = None;
+            for (i, &pos) in self.positions.iter().enumerate() {
+                let nal_type = nal_unit_type(&self.buf, pos);
+                if nal_type == 7 {
+                    sps_idx = Some(i);
+                    self.seen_sps = true;
+                    log::info!("decoder: found SPS at position {pos}, starting decode");
+                    break;
+                }
+            }
+            if let Some(idx) = sps_idx {
+                let sps_pos = self.positions[idx];
+                let tail = self.buf[sps_pos..].to_vec();
+                self.buf.clear();
+                self.buf.extend_from_slice(&tail);
+                return self.feed_raw(&[]);
+            }
+            let last = *self.positions.last().unwrap();
+            let tail = self.buf[last..].to_vec();
+            self.buf.clear();
+            self.buf.extend_from_slice(&tail);
+            return frames;
+        }
+
+        let last_complete = *self.positions.last().unwrap();
+        for i in 0..self.positions.len() - 1 {
+            let start = self.positions[i];
+            let end = self.positions[i + 1];
+            let nal_data = &self.buf[start..end];
+
+            let packet = codec::packet::Packet::copy(nal_data);
             if self.decoder.send_packet(&packet).is_ok() {
                 let mut decoded = ffmpeg::frame::Video::empty();
                 while self.decoder.receive_frame(&mut decoded).is_ok() {
@@ -71,6 +113,35 @@ impl H264Decoder {
             }
         }
 
+        let tail = self.buf[last_complete..].to_vec();
+        self.buf.clear();
+        self.buf.extend_from_slice(&tail);
+
+        frames
+    }
+
+    /// Flush buffered frames.
+    pub fn flush(&mut self) -> Vec<DecodedFrame> {
+        let mut frames = Vec::new();
+        if !self.buf.is_empty() {
+            let packet = codec::packet::Packet::copy(&self.buf);
+            if self.decoder.send_packet(&packet).is_ok() {
+                let mut decoded = ffmpeg::frame::Video::empty();
+                while self.decoder.receive_frame(&mut decoded).is_ok() {
+                    if let Some(frame) = self.convert_frame(&decoded) {
+                        frames.push(frame);
+                    }
+                }
+            }
+            self.buf.clear();
+        }
+        self.decoder.send_eof().ok();
+        let mut decoded = ffmpeg::frame::Video::empty();
+        while self.decoder.receive_frame(&mut decoded).is_ok() {
+            if let Some(frame) = self.convert_frame(&decoded) {
+                frames.push(frame);
+            }
+        }
         frames
     }
 
@@ -87,10 +158,10 @@ impl H264Decoder {
                 frame.format(),
                 width,
                 height,
-                Pixel::RGB24,
+                Pixel::BGRA,
                 width,
                 height,
-                scaling::Flags::FAST_BILINEAR,
+                scaling::Flags::POINT,
             )
             .ok();
             self.last_width = width;
@@ -114,61 +185,37 @@ impl H264Decoder {
     }
 }
 
-/// Split buffer at the next access unit boundary.
-/// An access unit starts with a VCL NAL (type 1 or 5) preceded by SPS/PPS.
-/// We split at the second occurrence of SPS (type 7) or IDR/non-IDR slice start.
-fn split_access_unit(buf: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    let starts = find_all_start_codes(buf);
-    if starts.len() < 2 {
-        return None;
-    }
-
-    // Find frame boundaries: SPS (7) or slice NALs (1, 5) with first_mb_in_slice == 0
-    let mut frame_starts = Vec::new();
-    for &pos in &starts {
-        let nal_type = nal_type_at(buf, pos)?;
-        if nal_type == 7 || nal_type == 1 || nal_type == 5 {
-            frame_starts.push(pos);
-        }
-    }
-
-    if frame_starts.len() < 2 {
-        // Prevent unbounded buffer growth
-        if buf.len() > 256 * 1024 {
-            let end = *starts.last().unwrap();
-            return Some((buf[..end].to_vec(), buf[end..].to_vec()));
-        }
-        return None;
-    }
-
-    let end = frame_starts[1];
-    Some((buf[..end].to_vec(), buf[end..].to_vec()))
-}
-
-fn nal_type_at(buf: &[u8], pos: usize) -> Option<u8> {
-    let offset = if buf.get(pos + 2) == Some(&0x01) {
-        pos + 3
-    } else if buf.get(pos + 3) == Some(&0x01) {
-        pos + 4
-    } else {
-        return None;
-    };
-    buf.get(offset).map(|b| b & 0x1F)
-}
-
-fn find_all_start_codes(buf: &[u8]) -> Vec<usize> {
-    let mut positions = Vec::new();
+fn find_start_codes_into(data: &[u8], positions: &mut Vec<usize>) {
+    let len = data.len();
     let mut i = 0;
-    while i < buf.len().saturating_sub(3) {
-        if buf[i] == 0x00 && buf[i + 1] == 0x00 {
-            if buf[i + 2] == 0x01 || (buf[i + 2] == 0x00 && i + 3 < buf.len() && buf[i + 3] == 0x01)
-            {
+    while i + 2 < len {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
                 positions.push(i);
                 i += 3;
+                continue;
+            } else if i + 3 < len && data[i + 2] == 0 && data[i + 3] == 1 {
+                positions.push(i);
+                i += 4;
                 continue;
             }
         }
         i += 1;
     }
-    positions
+}
+
+fn nal_unit_type(data: &[u8], start_code_pos: usize) -> u8 {
+    let header_pos = if start_code_pos + 3 < data.len()
+        && data[start_code_pos + 2] == 0
+        && data[start_code_pos + 3] == 1
+    {
+        start_code_pos + 4
+    } else {
+        start_code_pos + 3
+    };
+    if header_pos < data.len() {
+        data[header_pos] & 0x1F
+    } else {
+        0
+    }
 }

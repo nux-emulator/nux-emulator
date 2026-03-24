@@ -7,6 +7,8 @@ mod settings;
 mod state;
 mod toolbar;
 pub mod vm_launcher;
+mod wayland_compositor;
+mod wayland_protocol;
 mod window;
 
 use adw::prelude::*;

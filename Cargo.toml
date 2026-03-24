@@ -20,3 +20,18 @@ unsafe_code = "deny"
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
+
+# Optimize FFmpeg and image processing even in debug builds
+[profile.dev.package.ffmpeg-next]
+opt-level = 3
+[profile.dev.package.ffmpeg-sys-next]
+opt-level = 3
+
+# Optimize our own code in dev — video decode/render needs it
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

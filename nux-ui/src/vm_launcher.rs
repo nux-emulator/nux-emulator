@@ -1,4 +1,8 @@
-//! VM launcher — manages the `launch_cvd` process lifecycle.
+//! VM launcher — manages the crosvm process lifecycle.
+//!
+//! Supports two modes:
+//! - `start()`: Uses `launch_cvd` (full Cuttlefish stack, scrcpy display)
+//! - `start_direct()`: Runs crosvm directly (native Wayland display, 60fps)
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 use std::path::PathBuf;
@@ -30,7 +34,7 @@ impl Default for VmLaunchConfig {
 /// Manages the crosvm VM lifecycle via `launch_cvd`.
 #[derive(Debug)]
 pub struct VmLauncher {
-    config: VmLaunchConfig,
+    pub config: VmLaunchConfig,
     process: Arc<Mutex<Option<Child>>>,
 }
 
@@ -219,7 +223,9 @@ impl VmLauncher {
     }
 
     /// Start the VM via `launch_cvd`.
-    pub fn start(&self) -> Result<(), String> {
+    /// `pre_launch` runs after cleanup but before launch_cvd starts —
+    /// use this to bind the Wayland compositor socket.
+    pub fn start_with_hook<F: FnOnce()>(&self, pre_launch: F) -> Result<(), String> {
         if self.is_running() {
             return Err("VM is already running".to_owned());
         }
@@ -245,6 +251,9 @@ impl VmLauncher {
             ])
             .output();
         std::fs::create_dir_all(&self.config.home_dir).ok();
+
+        // Run pre-launch hook (bind Wayland compositor here)
+        pre_launch();
 
         // Setup networking
         self.setup_networking().ok();
@@ -283,6 +292,196 @@ impl VmLauncher {
         let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start launch_cvd: {e}"))?;
+
+        *self.process.lock().unwrap() = Some(child);
+        Ok(())
+    }
+
+    /// Start the VM via `launch_cvd` (no pre-launch hook).
+    pub fn start(&self) -> Result<(), String> {
+        self.start_with_hook(|| {})
+    }
+
+    /// Start the VM by running crosvm directly (bypasses launch_cvd).
+    /// Uses our Wayland compositor for native display at 60fps.
+    /// Requires disk images from a previous `launch_cvd` run.
+    pub fn start_direct(&self, wayland_sock: &str) -> Result<(), String> {
+        if self.is_running() {
+            return Err("VM is already running".to_owned());
+        }
+
+        // Kill any previous crosvm instances
+        let _ = Command::new("sudo")
+            .args(["pkill", "-9", "-f", "crosvm|process_restarter|secure_env"])
+            .output();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        self.setup_networking().ok();
+
+        let instance_dir = self.config.home_dir.join("cuttlefish/instances/cvd-1");
+        let internal_dir = instance_dir.join("internal");
+        let host_out = self.config.aosp_root.join("out/host/linux-x86");
+        let crosvm_bin = host_out.join("bin/crosvm");
+
+        // Verify disk images exist
+        let overlay = instance_dir.join("overlay.img");
+        if !overlay.exists() {
+            return Err(format!(
+                "Disk images not found at {}. Run launch_cvd once first to create them.",
+                instance_dir.display()
+            ));
+        }
+
+        // Create internal directory and log files (needs sudo since dir is root-owned)
+        let _ = Command::new("sudo")
+            .args(["mkdir", "-p", &internal_dir.to_string_lossy()])
+            .output();
+
+        // Serial ports — essential ones use files, HAL ports use sink
+        let kernel_log = internal_dir.join("kernel.log");
+        let logcat_log = internal_dir.join("logcat.log");
+        let crosvm_log = internal_dir.join("crosvm.log");
+        let crosvm_err = internal_dir.join("crosvm_err.log");
+
+        // Create log files as root
+        for f in [&kernel_log, &logcat_log, &crosvm_log, &crosvm_err] {
+            let _ = Command::new("sudo")
+                .args(["touch", &f.to_string_lossy()])
+                .output();
+            let _ = Command::new("sudo")
+                .args(["chmod", "666", &f.to_string_lossy()])
+                .output();
+        }
+
+        // Build crosvm command
+        let mut cmd = Command::new("sudo");
+        cmd.arg("-E").arg(&crosvm_bin);
+        cmd.args(["--extended-status", "run"]);
+
+        // Control socket — remove stale one
+        let control_sock = internal_dir.join("crosvm_control.sock");
+        let _ = Command::new("sudo")
+            .args(["rm", "-f", &control_sock.to_string_lossy()])
+            .output();
+        cmd.arg(format!("--socket={}", control_sock.display()));
+
+        // Core settings
+        cmd.args(["--no-smt", "--no-usb", "--core-scheduling=false"]);
+        cmd.arg(format!("--mem={}", self.config.memory_mb));
+        cmd.arg(format!("--cpus={}", self.config.cpus));
+        cmd.arg("--disable-sandbox");
+
+        // GPU + Wayland display (our compositor)
+        cmd.arg(format!("--wayland-sock={wayland_sock}"));
+        cmd.arg(
+            "--gpu=displays=[[mode=windowed[720,1280],dpi=[320,320],refresh-rate=60]],\
+             context-types=gfxstream-gles:gfxstream-vulkan:gfxstream-composer,\
+             pci-address=00:02.0,egl=true,surfaceless=true,glx=false,gles=true,\
+             renderer-features=\"GlProgramBinaryLinkStatus:enabled\"",
+        );
+
+        // Disk images
+        cmd.arg(format!(
+            "--block=path={}",
+            instance_dir.join("overlay.img").display()
+        ));
+        cmd.arg(format!(
+            "--block=path={}",
+            instance_dir.join("persistent_composite.img").display()
+        ));
+        cmd.arg(format!(
+            "--block=path={}",
+            instance_dir.join("sdcard.img").display()
+        ));
+
+        // BIOS
+        cmd.arg(format!(
+            "--bios={}",
+            host_out
+                .join("etc/bootloader_x86_64/bootloader.crosvm")
+                .display()
+        ));
+
+        // pflash + pmem
+        cmd.arg(format!(
+            "--pflash={}",
+            instance_dir.join("pflash.img").display()
+        ));
+        cmd.arg(format!(
+            "--pmem=path={}",
+            instance_dir.join("hwcomposer-pmem").display()
+        ));
+        cmd.arg(format!(
+            "--pmem=path={}",
+            instance_dir.join("access-kregistry").display()
+        ));
+        cmd.arg(format!(
+            "--pstore=path={},size=2097152",
+            instance_dir.join("pstore").display()
+        ));
+
+        // Network
+        cmd.arg("--net=tap-name=cvd-mtap-01,mac=00:1a:11:e0:cf:00,pci-address=00:01.1");
+        cmd.arg("--net=tap-name=cvd-etap-01,mac=00:1a:11:e1:cf:00,pci-address=00:01.2");
+
+        // vsock
+        cmd.arg("--vsock=cid=3");
+
+        // Serial ports
+        cmd.arg(format!(
+            "--serial=hardware=virtio-console,num=1,type=file,path={},console=true",
+            kernel_log.display()
+        ));
+        cmd.arg(format!(
+            "--serial=hardware=serial,num=1,type=file,path={},earlycon=true",
+            kernel_log.display()
+        ));
+        cmd.arg("--serial=hardware=virtio-console,num=2,type=sink");
+        cmd.arg(format!(
+            "--serial=hardware=virtio-console,num=3,type=file,path={}",
+            logcat_log.display()
+        ));
+
+        // HAL serial ports — all sinks (no HAL services running)
+        for num in 4..=17 {
+            cmd.arg(format!(
+                "--serial=hardware=virtio-console,num={num},type=sink"
+            ));
+        }
+
+        // GPU environment
+        for (key, val) in Self::gpu_env() {
+            cmd.env(&key, &val);
+        }
+        cmd.env(
+            "DISPLAY",
+            std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
+        );
+
+        // Redirect output to log files
+        let stdout_file = std::fs::File::create(&crosvm_log)
+            .or_else(|_| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&crosvm_log)
+            })
+            .map_err(|e| format!("create crosvm.log: {e}"))?;
+        let stderr_file = std::fs::File::create(&crosvm_err)
+            .or_else(|_| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&crosvm_err)
+            })
+            .map_err(|e| format!("create crosvm_err.log: {e}"))?;
+        cmd.stdout(stdout_file).stderr(stderr_file);
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to start crosvm: {e}"))?;
+
+        log::info!("vm: crosvm started directly (pid={})", child.id());
 
         *self.process.lock().unwrap() = Some(child);
         Ok(())
