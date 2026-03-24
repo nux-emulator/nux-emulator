@@ -122,7 +122,7 @@ pub fn start_wayland_display(
             vw2.store(frame.width, Ordering::Relaxed);
             vh2.store(frame.height, Ordering::Relaxed);
 
-            let bytes = glib::Bytes::from(&frame.data);
+            let bytes = glib::Bytes::from_owned(frame.data);
             // crosvm sends BGRA (B8G8R8A8) via wl_shm ARGB8888
             let texture = gdk::MemoryTexture::new(
                 frame.width as i32,
