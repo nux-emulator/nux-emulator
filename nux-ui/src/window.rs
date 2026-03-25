@@ -633,12 +633,13 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
-                    // Enable WiFi in background
+                    // Enable WiFi and ARM translation in background
+                    // ARM translation: SELinux permissive + binfmt_misc + zygote restart
+                    // Must complete BEFORE scrcpy connects (zygote restart kills it)
                     {
                         let launcher2 = launcher.clone();
-                        std::thread::spawn(move || {
-                            let _ = launcher2.enable_wifi();
-                        });
+                        let _ = launcher2.enable_wifi();
+                        let _ = launcher2.setup_arm_translation();
                     }
 
                     // Use Wayland compositor for native display

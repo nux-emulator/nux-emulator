@@ -273,6 +273,7 @@ impl VmLauncher {
                 "--report_anonymous_usage_stats=n",
                 "--enable_sandbox=false",
                 "--netsim=false",
+                "--blank_data_image_mb=16384",
             ])
             .env(
                 "DISPLAY",
@@ -537,21 +538,32 @@ impl VmLauncher {
     pub fn setup_arm_translation(&self) -> Result<(), String> {
         let adb = |args: &[&str]| -> Result<std::process::Output, String> {
             Command::new("adb")
-                .args(["-s", "127.0.0.1:6520", "shell"])
+                .args(["-s", "127.0.0.1:6520"])
                 .args(args)
                 .output()
                 .map_err(|e| format!("adb: {e}"))
         };
 
-        // Set SELinux permissive so ndk_translation can set its properties
-        let _ = adb(&["su", "0", "setenforce", "0"]);
+        // Enable root and remount system as writable
+        let _ = adb(&["root"]);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = adb(&["remount"]);
+        std::thread::sleep(std::time::Duration::from_secs(1));
 
-        // Set the properties that SELinux blocked during init
-        let _ = adb(&["su", "0", "setprop", "ro.ndk_translation.version", "0.2.3"]);
-        let _ = adb(&["su", "0", "setprop", "ro.enable.native.bridge.exec", "1"]);
+        // Copy libndk_translation.so to /system/lib64 where the runtime can find it
+        let _ = adb(&[
+            "shell",
+            "cp",
+            "/vendor/lib64/libndk_translation.so",
+            "/system/lib64/libndk_translation.so",
+        ]);
+
+        // Set SELinux permissive
+        let _ = adb(&["shell", "su", "0", "setenforce", "0"]);
 
         // Mount binfmt_misc and register ARM translation entries
         let _ = adb(&[
+            "shell",
             "su",
             "0",
             "mount",
@@ -562,17 +574,24 @@ impl VmLauncher {
         ]);
         for entry in &["arm64_exe", "arm64_dyn", "arm_exe", "arm_dyn"] {
             let src = format!("/vendor/etc/binfmt_misc/{entry}");
-            let _ = adb(&["su", "0", "cp", &src, "/proc/sys/fs/binfmt_misc/register"]);
+            let _ = adb(&[
+                "shell",
+                "su",
+                "0",
+                "cp",
+                &src,
+                "/proc/sys/fs/binfmt_misc/register",
+            ]);
         }
 
-        // Restart zygote so native bridge reinitializes with correct properties
+        // Restart zygote so native bridge finds the library and reinitializes
         log::info!("vm: restarting zygote for native bridge initialization...");
-        let _ = adb(&["su", "0", "setprop", "ctl.restart", "zygote"]);
+        let _ = adb(&["shell", "su", "0", "setprop", "ctl.restart", "zygote"]);
 
         // Wait for framework to come back
         for _ in 0..30 {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            if let Ok(out) = adb(&["getprop", "sys.boot_completed"]) {
+            if let Ok(out) = adb(&["shell", "getprop", "sys.boot_completed"]) {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
                 if s == "1" {
                     break;
