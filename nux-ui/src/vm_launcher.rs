@@ -559,7 +559,7 @@ impl VmLauncher {
             "/proc/sys/fs/binfmt_misc",
         ]);
         for entry in &["arm64_exe", "arm64_dyn", "arm_exe", "arm_dyn"] {
-            let src = format!("/vendor/etc/binfmt_misc/{entry}");
+            let src = format!("/system_ext/etc/binfmt_misc/{entry}");
             let _ = adb(&[
                 "shell",
                 "su",
