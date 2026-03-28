@@ -301,10 +301,9 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                     if found {
                         log::info!("vm: crosvm detected, swapping Wayland socket");
 
-                        // Kill webRTC immediately (it holds the old socket fd)
-                        let _ = std::process::Command::new("sudo")
-                            .args(["pkill", "-9", "-f", "webRTC"])
-                            .output();
+                        // DON'T kill webRTC — process_monitor detects the exit
+                        // and shuts down the entire VM. webRTC already has its fd,
+                        // it doesn't need the socket file.
 
                         // Make the directory writable so we can bind our socket as non-root
                         let _ = std::process::Command::new("sudo")
