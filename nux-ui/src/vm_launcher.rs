@@ -544,65 +544,7 @@ impl VmLauncher {
                 .map_err(|e| format!("adb: {e}"))
         };
 
-        let product_out = self.config.aosp_root.join("out/target/product/vsoc_x86_64");
-        let prebuilts = self
-            .config
-            .aosp_root
-            .join("vendor/nux/arm-translation/prebuilts");
-
-        // Enable root and remount system as writable (overlayfs)
-        let _ = adb(&["root"]);
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        let _ = adb(&["remount"]);
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        // Push x86_64 ndk_translation libraries to /system/lib64 via adb push
-        // (adb push writes directly to overlayfs upper, no ELF corruption)
-        let lib64 = prebuilts.join("lib64");
-        for name in &["libndk_translation.so", "libndk_translation_exec_region.so"] {
-            let _ = Command::new("adb")
-                .args(["-s", "127.0.0.1:6520", "push"])
-                .arg(lib64.join(name))
-                .arg(format!("/system/lib64/{name}"))
-                .output();
-        }
-        // Push proxy libraries
-        if let Ok(entries) = std::fs::read_dir(&lib64) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("libndk_translation_proxy_") {
-                    let _ = Command::new("adb")
-                        .args(["-s", "127.0.0.1:6520", "push"])
-                        .arg(entry.path())
-                        .arg(format!("/system/lib64/{name_str}"))
-                        .output();
-                }
-            }
-        }
-
-        // Add /vendor/${LIB} to default linker namespace search + permitted paths
-        // so native bridge can find ARM64/ARM libraries in /vendor/
-        let _ = adb(&[
-            "shell",
-            "su",
-            "0",
-            "sed",
-            "-i",
-            "s|namespace.default.search.paths = /system/${LIB}|namespace.default.search.paths = /system/${LIB}\\nnamespace.default.search.paths += /vendor/${LIB}|",
-            "/linkerconfig/ld.config.txt",
-        ]);
-        let _ = adb(&[
-            "shell",
-            "su",
-            "0",
-            "sed",
-            "-i",
-            "/namespace.default.permitted.paths/a namespace.default.permitted.paths += /vendor/${LIB}",
-            "/linkerconfig/ld.config.txt",
-        ]);
-
-        // Set SELinux permissive
+        // Set SELinux permissive (ndk_translation.rc triggers blocked by SELinux)
         let _ = adb(&["shell", "su", "0", "setenforce", "0"]);
 
         // Mount binfmt_misc and register ARM translation entries
