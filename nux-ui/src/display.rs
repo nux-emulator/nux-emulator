@@ -201,9 +201,14 @@ pub fn start_wayland_display(
                         if !running_ctrl.load(Ordering::Relaxed) {
                             return;
                         }
-                        // Check if control socket is still alive by checking the lock
-                        let alive = ctrl.lock().unwrap().is_some();
+                        // Check if control socket is still alive
+                        let alive = ctrl
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map_or(false, |cs| cs.is_alive());
                         if !alive {
+                            log::info!("display: scrcpy control died, will reconnect");
                             break;
                         }
                     }

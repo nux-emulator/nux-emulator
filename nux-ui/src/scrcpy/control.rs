@@ -29,6 +29,7 @@ pub struct ControlSocket {
     stream: TcpStream,
     screen_width: u16,
     screen_height: u16,
+    alive: bool,
 }
 
 impl ControlSocket {
@@ -38,7 +39,13 @@ impl ControlSocket {
             stream,
             screen_width,
             screen_height,
+            alive: true,
         }
+    }
+
+    /// Check if the connection is still alive.
+    pub fn is_alive(&self) -> bool {
+        self.alive
     }
 
     /// Update screen dimensions (when video resolution changes).
@@ -78,7 +85,10 @@ impl ControlSocket {
 
         match self.stream.write_all(&buf) {
             Ok(()) => {}
-            Err(e) => log::error!("control: write failed: {e}"),
+            Err(e) => {
+                log::error!("control: write failed: {e}");
+                self.alive = false;
+            }
         }
     }
 
