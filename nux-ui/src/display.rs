@@ -590,6 +590,10 @@ fn w2a(w: &impl IsA<gtk::Widget>, wx: f64, wy: f64, vw: u32, vh: u32) -> (i32, i
     if ww <= 0.0 || wh <= 0.0 || vw == 0 || vh == 0 {
         return (-1, -1);
     }
+
+    // Check rotation state
+    let rotated = vw > vh; // landscape if width > height (after our rotation)
+
     let va = vw as f64 / vh as f64;
     let wa = ww / wh;
     let (rw, rh, ox, oy) = if va > wa {
@@ -600,9 +604,25 @@ fn w2a(w: &impl IsA<gtk::Widget>, wx: f64, wy: f64, vw: u32, vh: u32) -> (i32, i
     if wx < ox || wx > ox + rw || wy < oy || wy > oy + rh {
         return (-1, -1);
     }
-    let ax = ((wx - ox) / rw * 720.0).round().clamp(0.0, 719.0) as i32;
-    let ay = ((wy - oy) / rh * 1280.0).round().clamp(0.0, 1279.0) as i32;
-    (ax, ay)
+
+    // Normalized position within the rendered area
+    let nx = (wx - ox) / rw;
+    let ny = (wy - oy) / rh;
+
+    if rotated {
+        // Landscape: reverse the 90° CCW rotation
+        // Our rotation: portrait(px,py) → landscape(py, 719-px)
+        // Reverse: portrait_x = 719 - ly, portrait_y = lx
+        // In normalized: ax = (1-ny)*720, ay = nx*1280
+        let ax = ((1.0 - ny) * 720.0).round().clamp(0.0, 719.0) as i32;
+        let ay = (nx * 1280.0).round().clamp(0.0, 1279.0) as i32;
+        (ax, ay)
+    } else {
+        // Portrait: direct mapping
+        let ax = (nx * 720.0).round().clamp(0.0, 719.0) as i32;
+        let ay = (ny * 1280.0).round().clamp(0.0, 1279.0) as i32;
+        (ax, ay)
+    }
 }
 
 fn connect_scrcpy_control() -> Result<ControlSocket, String> {
