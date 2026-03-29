@@ -338,19 +338,23 @@ fn upload_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &WaylandFr
     // If landscape, rotate pixel data 90° CCW so it displays correctly
     let (upload_w, upload_h, upload_data);
     if state.rotation == 1 && w < h {
-        // Rotate 90° CCW: (x,y) -> (y, w-1-x)
+        // Rotate 90° CCW: src(x,y) -> dst(y, w-1-x)
         upload_w = h;
         upload_h = w;
-        let mut rotated = vec![0u8; (upload_w * upload_h * 4) as usize];
-        let stride_pixels = frame.stride / 4;
-        for y in 0..h {
-            for x in 0..w {
-                let src = ((y * stride_pixels + x) * 4) as usize;
+        let src_stride = frame.stride as usize;
+        let dst_stride = (upload_w * 4) as usize;
+        let mut rotated = vec![0u8; dst_stride * upload_h as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let src_off = y * src_stride + x * 4;
                 let dst_x = y;
-                let dst_y = w - 1 - x;
-                let dst = ((dst_y * upload_w + dst_x) * 4) as usize;
-                if src + 3 < data.len() && dst + 3 < rotated.len() {
-                    rotated[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+                let dst_y = (w as usize) - 1 - x;
+                let dst_off = dst_y * dst_stride + dst_x * 4;
+                if src_off + 3 < data.len() && dst_off + 3 < rotated.len() {
+                    rotated[dst_off] = data[src_off];
+                    rotated[dst_off + 1] = data[src_off + 1];
+                    rotated[dst_off + 2] = data[src_off + 2];
+                    rotated[dst_off + 3] = data[src_off + 3];
                 }
             }
         }
