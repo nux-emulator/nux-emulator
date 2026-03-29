@@ -629,6 +629,11 @@ fn connect_scrcpy_control() -> Result<ControlSocket, String> {
     use crate::scrcpy::server;
     server::check_device()?;
 
+    // Clear stale ADB forwards (previous scrcpy server may have died)
+    let _ = std::process::Command::new("adb")
+        .args(["-s", "127.0.0.1:6520", "forward", "--remove-all"])
+        .output();
+
     // Get actual screen dimensions (may be rotated)
     let wm_output = std::process::Command::new("adb")
         .args(["-s", "127.0.0.1:6520", "shell", "wm", "size"])
