@@ -313,30 +313,37 @@ fn upload_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &WaylandFr
     let h = frame.height;
     let data = frame.data();
 
-    // Detect rotation: poll Android's user_rotation setting every ~60 frames
+    // Detect rotation: check actual display orientation every ~60 frames
     static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     if count % 60 == 0 {
+        // Check actual display orientation (not user_rotation setting)
+        // mCurrentOrientation: 0=portrait, 1=landscape, 2=reverse portrait, 3=reverse landscape
         if let Ok(output) = std::process::Command::new("adb")
-            .args([
-                "-s",
-                "127.0.0.1:6520",
-                "shell",
-                "settings",
-                "get",
-                "system",
-                "user_rotation",
-            ])
+            .args(["-s", "127.0.0.1:6520", "shell", "dumpsys", "display"])
             .output()
         {
-            let rot = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse::<u32>()
+            let out = String::from_utf8_lossy(&output.stdout);
+            let rot = out
+                .lines()
+                .find(|l| l.contains("mCurrentOrientation="))
+                .and_then(|l| l.trim().strip_prefix("mCurrentOrientation="))
+                .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(0);
-            if rot != state.rotation {
-                log::info!("display: rotation changed to {rot}");
-                state.rotation = rot;
-                CURRENT_ROTATION.store(rot, Ordering::Relaxed);
+            // Landscape = 1 or 3
+            let is_landscape = if rot == 1 || rot == 3 { 1 } else { 0 };
+            if is_landscape != state.rotation {
+                log::info!(
+                    "display: orientation changed to {} (mCurrentOrientation={})",
+                    if is_landscape == 1 {
+                        "landscape"
+                    } else {
+                        "portrait"
+                    },
+                    rot
+                );
+                state.rotation = is_landscape;
+                CURRENT_ROTATION.store(is_landscape, Ordering::Relaxed);
             }
         }
     }

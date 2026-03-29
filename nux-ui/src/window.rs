@@ -247,7 +247,7 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
     });
     win.add_action(&shake);
 
-    // Rotate
+    // Rotate — toggle auto-rotate on/off
     let rotate = SimpleAction::new("rotate", None);
     let last_rotate = Rc::new(std::cell::Cell::new(std::time::Instant::now()));
     let last_rotate_clone = last_rotate.clone();
@@ -261,7 +261,7 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
 
         log::info!("rotate action triggered");
         std::thread::spawn(|| {
-            // Get current rotation
+            // Get current auto-rotate state
             let output = std::process::Command::new("adb")
                 .args([
                     "-s",
@@ -270,54 +270,58 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                     "settings",
                     "get",
                     "system",
-                    "user_rotation",
+                    "accelerometer_rotation",
                 ])
                 .output();
-            let current = output
+            let auto_rotate = output
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(0);
 
-            // Cycle: 0 (portrait) → 1 (landscape) → 0
-            let next = if current == 0 { 1 } else { 0 };
-
-            // Disable auto-rotate and set manual rotation
-            let _ = std::process::Command::new("adb")
-                .args([
-                    "-s",
-                    "127.0.0.1:6520",
-                    "shell",
-                    "settings",
-                    "put",
-                    "system",
-                    "accelerometer_rotation",
-                    "0",
-                ])
-                .output();
-            let _ = std::process::Command::new("adb")
-                .args([
-                    "-s",
-                    "127.0.0.1:6520",
-                    "shell",
-                    "settings",
-                    "put",
-                    "system",
-                    "user_rotation",
-                    &next.to_string(),
-                ])
-                .output();
-
-            // Reset any wm size override
-            let _ = std::process::Command::new("adb")
-                .args(["-s", "127.0.0.1:6520", "shell", "wm", "size", "reset"])
-                .output();
-
-            log::info!(
-                "rotate: set rotation to {} ({})",
-                next,
-                if next == 0 { "portrait" } else { "landscape" }
-            );
+            if auto_rotate == 1 {
+                // Currently auto-rotate — switch to forced portrait
+                let _ = std::process::Command::new("adb")
+                    .args([
+                        "-s",
+                        "127.0.0.1:6520",
+                        "shell",
+                        "settings",
+                        "put",
+                        "system",
+                        "accelerometer_rotation",
+                        "0",
+                    ])
+                    .output();
+                let _ = std::process::Command::new("adb")
+                    .args([
+                        "-s",
+                        "127.0.0.1:6520",
+                        "shell",
+                        "settings",
+                        "put",
+                        "system",
+                        "user_rotation",
+                        "0",
+                    ])
+                    .output();
+                log::info!("rotate: forced portrait (auto-rotate off)");
+            } else {
+                // Currently locked — enable auto-rotate so apps choose their orientation
+                let _ = std::process::Command::new("adb")
+                    .args([
+                        "-s",
+                        "127.0.0.1:6520",
+                        "shell",
+                        "settings",
+                        "put",
+                        "system",
+                        "accelerometer_rotation",
+                        "1",
+                    ])
+                    .output();
+                log::info!("rotate: auto-rotate enabled (apps choose orientation)");
+            }
         });
     });
     win.add_action(&rotate);
