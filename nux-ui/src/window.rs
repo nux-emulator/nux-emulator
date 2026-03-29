@@ -249,7 +249,16 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
 
     // Rotate
     let rotate = SimpleAction::new("rotate", None);
-    rotate.connect_activate(|_, _| {
+    let last_rotate = Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+    let last_rotate_clone = last_rotate.clone();
+    rotate.connect_activate(move |_, _| {
+        // Debounce: ignore clicks within 1 second
+        let now = std::time::Instant::now();
+        if now.duration_since(last_rotate_clone.get()).as_millis() < 1000 {
+            return;
+        }
+        last_rotate_clone.set(now);
+
         log::info!("rotate action triggered");
         std::thread::spawn(|| {
             // Get current rotation
