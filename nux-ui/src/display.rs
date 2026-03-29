@@ -531,11 +531,15 @@ fn setup_input_controllers(
         );
         if ax >= 0 && ay >= 0 {
             let mut used_scrcpy = false;
-            if let Ok(mut g) = c3.lock() {
-                if let Some(cs) = g.as_mut() {
-                    if cs.is_alive() {
-                        cs.touch_down(ax as u32, ay as u32);
-                        used_scrcpy = true;
+            let rotated = CURRENT_ROTATION.load(Ordering::Relaxed) == 1;
+            // Only use scrcpy in portrait — scrcpy doesn't handle rotation
+            if !rotated {
+                if let Ok(mut g) = c3.lock() {
+                    if let Some(cs) = g.as_mut() {
+                        if cs.is_alive() {
+                            cs.touch_down(ax as u32, ay as u32);
+                            used_scrcpy = true;
+                        }
                     }
                 }
             }
@@ -549,11 +553,7 @@ fn setup_input_controllers(
                 };
                 let ww = da.width() as f64;
                 let wh = da.height() as f64;
-                let va = if rotated {
-                    1280.0 / 720.0
-                } else {
-                    720.0 / 1280.0
-                };
+                let va = disp_w / disp_h;
                 let wa = ww / wh;
                 let (rw, rh, ox2, oy2) = if va > wa {
                     (ww, ww / va, 0.0, (wh - ww / va) / 2.0)
@@ -564,6 +564,7 @@ fn setup_input_controllers(
                 let ny = (y - oy2) / rh;
                 let tap_x = (nx * disp_w).round().clamp(0.0, disp_w - 1.0) as u32;
                 let tap_y = (ny * disp_h).round().clamp(0.0, disp_h - 1.0) as u32;
+                log::info!("input: ADB fallback tap({tap_x}, {tap_y}) rotated={rotated} widget=({x:.0},{y:.0}) widget_size={ww:.0}x{wh:.0}");
                 std::thread::spawn(move || {
                     let _ = std::process::Command::new("adb")
                         .args([
