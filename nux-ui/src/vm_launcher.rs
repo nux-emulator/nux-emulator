@@ -25,8 +25,8 @@ impl Default for VmLaunchConfig {
             aosp_root: PathBuf::from("/build2/nux-emulator/nux-android-image/aosp"),
             home_dir: PathBuf::from("/tmp/nux-cf"),
             gpu_mode: "gfxstream".to_owned(),
-            cpus: 4,
-            memory_mb: 4096,
+            cpus: 8,
+            memory_mb: 8192,
         }
     }
 }
