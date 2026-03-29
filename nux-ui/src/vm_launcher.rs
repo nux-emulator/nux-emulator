@@ -544,7 +544,39 @@ impl VmLauncher {
                 .map_err(|e| format!("adb: {e}"))
         };
 
-        // Set SELinux permissive (ndk_translation.rc triggers blocked by SELinux)
+        let prebuilts = self
+            .config
+            .aosp_root
+            .join("vendor/nux/arm-translation/prebuilts");
+
+        // Enable root and remount to push missing ARM64 bionic libs
+        let _ = adb(&["root"]);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let _ = adb(&["remount"]);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Push Google's ARM64 libc.so (build system filter excludes it from image)
+        let arm64_lib = prebuilts.join("lib64/arm64/libc.so");
+        if arm64_lib.exists() {
+            let _ = Command::new("adb")
+                .args(["-s", "127.0.0.1:6520", "push"])
+                .arg(&arm64_lib)
+                .arg("/system/lib64/arm64/libc.so")
+                .output();
+            log::info!("vm: pushed ARM64 libc.so to /system/lib64/arm64/");
+        }
+
+        // Delete the 6GB scratch image that adb remount creates
+        let _ = adb(&[
+            "shell",
+            "su",
+            "0",
+            "rm",
+            "-f",
+            "/data/gsi/remount/scratch.img.0000",
+        ]);
+
+        // Set SELinux permissive
         let _ = adb(&["shell", "su", "0", "setenforce", "0"]);
 
         // Mount binfmt_misc and register ARM translation entries
