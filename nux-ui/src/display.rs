@@ -631,6 +631,58 @@ fn setup_input_controllers(
     });
     area.add_controller(drag);
 
+    // Mouse scroll → Android scroll
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    let da5 = display_area.clone();
+    scroll.connect_scroll(move |_, _dx, dy| {
+        // Convert scroll to swipe: scroll down = swipe up on screen
+        let ww = da5.width() as f64;
+        let wh = da5.height() as f64;
+        let cx = (ww / 2.0) as u32;
+        let cy = (wh / 2.0) as u32;
+        let distance = (dy * 200.0) as i32; // 200px per scroll tick
+
+        let rotated = CURRENT_ROTATION.load(Ordering::Relaxed) == 1;
+        let (disp_w, disp_h) = if rotated {
+            (1280.0, 720.0)
+        } else {
+            (720.0, 1280.0)
+        };
+
+        // Map center of widget to display coordinates
+        let va = disp_w / disp_h;
+        let wa = ww / wh;
+        let (rw, rh, ox, oy) = if va > wa {
+            (ww, ww / va, 0.0, (wh - ww / va) / 2.0)
+        } else {
+            (wh * va, wh, (ww - wh * va) / 2.0, 0.0)
+        };
+        let nx = (ww / 2.0 - ox) / rw;
+        let ny = (wh / 2.0 - oy) / rh;
+        let sx = (nx * disp_w).round().clamp(0.0, disp_w - 1.0) as i32;
+        let sy = (ny * disp_h).round().clamp(0.0, disp_h - 1.0) as i32;
+        let ey = (sy + distance).clamp(0, disp_h as i32 - 1);
+
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("adb")
+                .args([
+                    "-s",
+                    "127.0.0.1:6520",
+                    "shell",
+                    "input",
+                    "swipe",
+                    &sx.to_string(),
+                    &sy.to_string(),
+                    &sx.to_string(),
+                    &ey.to_string(),
+                    "100",
+                ])
+                .output();
+        });
+        glib::Propagation::Stop
+    });
+    area.add_controller(scroll);
+
     let key = gtk::EventControllerKey::new();
     let c6 = control;
     key.connect_key_pressed(move |_, keyval, _kc, modifier| {
