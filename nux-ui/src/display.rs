@@ -540,8 +540,30 @@ fn setup_input_controllers(
                 }
             }
             if !used_scrcpy {
-                let ax = ax as u32;
-                let ay = ay as u32;
+                // ADB input uses current display coordinates (not portrait-rotated)
+                let rotated = CURRENT_ROTATION.load(Ordering::Relaxed) == 1;
+                let (disp_w, disp_h) = if rotated {
+                    (1280.0, 720.0)
+                } else {
+                    (720.0, 1280.0)
+                };
+                let ww = da.width() as f64;
+                let wh = da.height() as f64;
+                let va = if rotated {
+                    1280.0 / 720.0
+                } else {
+                    720.0 / 1280.0
+                };
+                let wa = ww / wh;
+                let (rw, rh, ox2, oy2) = if va > wa {
+                    (ww, ww / va, 0.0, (wh - ww / va) / 2.0)
+                } else {
+                    (wh * va, wh, (ww - wh * va) / 2.0, 0.0)
+                };
+                let nx = (x - ox2) / rw;
+                let ny = (y - oy2) / rh;
+                let tap_x = (nx * disp_w).round().clamp(0.0, disp_w - 1.0) as u32;
+                let tap_y = (ny * disp_h).round().clamp(0.0, disp_h - 1.0) as u32;
                 std::thread::spawn(move || {
                     let _ = std::process::Command::new("adb")
                         .args([
@@ -550,8 +572,8 @@ fn setup_input_controllers(
                             "shell",
                             "input",
                             "tap",
-                            &ax.to_string(),
-                            &ay.to_string(),
+                            &tap_x.to_string(),
+                            &tap_y.to_string(),
                         ])
                         .output();
                 });
