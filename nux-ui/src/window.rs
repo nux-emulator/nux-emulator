@@ -299,17 +299,15 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                 ])
                 .output();
 
-            // Override display size to match rotation
-            let size = if next == 1 { "1280x720" } else { "720x1280" };
+            // Reset any wm size override
             let _ = std::process::Command::new("adb")
-                .args(["-s", "127.0.0.1:6520", "shell", "wm", "size", size])
+                .args(["-s", "127.0.0.1:6520", "shell", "wm", "size", "reset"])
                 .output();
 
             log::info!(
-                "rotate: set rotation to {} ({}, display {})",
+                "rotate: set rotation to {} ({})",
                 next,
-                if next == 0 { "portrait" } else { "landscape" },
-                size
+                if next == 0 { "portrait" } else { "landscape" }
             );
         });
     });
