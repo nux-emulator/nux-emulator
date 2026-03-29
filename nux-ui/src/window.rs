@@ -247,10 +247,64 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
     });
     win.add_action(&shake);
 
-    // Rotate (stub)
+    // Rotate
     let rotate = SimpleAction::new("rotate", None);
     rotate.connect_activate(|_, _| {
         log::info!("rotate action triggered");
+        std::thread::spawn(|| {
+            // Get current rotation
+            let output = std::process::Command::new("adb")
+                .args([
+                    "-s",
+                    "127.0.0.1:6520",
+                    "shell",
+                    "settings",
+                    "get",
+                    "system",
+                    "user_rotation",
+                ])
+                .output();
+            let current = output
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+
+            // Cycle: 0 (portrait) → 1 (landscape) → 0
+            let next = if current == 0 { 1 } else { 0 };
+
+            // Disable auto-rotate and set manual rotation
+            let _ = std::process::Command::new("adb")
+                .args([
+                    "-s",
+                    "127.0.0.1:6520",
+                    "shell",
+                    "settings",
+                    "put",
+                    "system",
+                    "accelerometer_rotation",
+                    "0",
+                ])
+                .output();
+            let _ = std::process::Command::new("adb")
+                .args([
+                    "-s",
+                    "127.0.0.1:6520",
+                    "shell",
+                    "settings",
+                    "put",
+                    "system",
+                    "user_rotation",
+                    &next.to_string(),
+                ])
+                .output();
+
+            log::info!(
+                "rotate: set rotation to {} ({})",
+                next,
+                if next == 0 { "portrait" } else { "landscape" }
+            );
+        });
     });
     win.add_action(&rotate);
 
