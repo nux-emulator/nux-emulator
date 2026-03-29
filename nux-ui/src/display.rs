@@ -498,9 +498,18 @@ fn setup_input_controllers(
     right_click.connect_released(move |_, _, _, _| {
         if let Ok(mut g) = c2.lock() {
             if let Some(cs) = g.as_mut() {
-                cs.back();
+                if cs.is_alive() {
+                    cs.back();
+                    return;
+                }
             }
         }
+        // Fallback: ADB input
+        std::thread::spawn(|| {
+            let _ = std::process::Command::new("adb")
+                .args(["-s", "127.0.0.1:6520", "shell", "input", "keyevent", "4"])
+                .output();
+        });
     });
     area.add_controller(right_click);
 
@@ -521,10 +530,31 @@ fn setup_input_controllers(
             vh.load(Ordering::Relaxed),
         );
         if ax >= 0 && ay >= 0 {
+            let mut used_scrcpy = false;
             if let Ok(mut g) = c3.lock() {
                 if let Some(cs) = g.as_mut() {
-                    cs.touch_down(ax as u32, ay as u32);
+                    if cs.is_alive() {
+                        cs.touch_down(ax as u32, ay as u32);
+                        used_scrcpy = true;
+                    }
                 }
+            }
+            if !used_scrcpy {
+                let ax = ax as u32;
+                let ay = ay as u32;
+                std::thread::spawn(move || {
+                    let _ = std::process::Command::new("adb")
+                        .args([
+                            "-s",
+                            "127.0.0.1:6520",
+                            "shell",
+                            "input",
+                            "tap",
+                            &ax.to_string(),
+                            &ay.to_string(),
+                        ])
+                        .output();
+                });
             }
         }
     });
@@ -544,7 +574,9 @@ fn setup_input_controllers(
             if ax >= 0 && ay >= 0 {
                 if let Ok(mut g) = c4.lock() {
                     if let Some(cs) = g.as_mut() {
-                        cs.touch_move(ax as u32, ay as u32);
+                        if cs.is_alive() {
+                            cs.touch_move(ax as u32, ay as u32);
+                        }
                     }
                 }
             }
@@ -566,7 +598,9 @@ fn setup_input_controllers(
             if ax >= 0 && ay >= 0 {
                 if let Ok(mut g) = c5.lock() {
                     if let Some(cs) = g.as_mut() {
-                        cs.touch_up(ax as u32, ay as u32);
+                        if cs.is_alive() {
+                            cs.touch_up(ax as u32, ay as u32);
+                        }
                     }
                 }
             }
