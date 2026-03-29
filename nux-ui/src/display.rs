@@ -490,12 +490,21 @@ fn setup_input_controllers(
     display_area: &gtk::DrawingArea,
     video_width: Arc<AtomicU32>,
     video_height: Arc<AtomicU32>,
-    _control: Arc<Mutex<Option<ControlSocket>>>,
+    control: Arc<Mutex<Option<ControlSocket>>>,
 ) {
-    // Right click -> back
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
+    let c2 = control.clone();
     right_click.connect_released(move |_, _, _, _| {
+        if let Ok(mut g) = c2.lock() {
+            if let Some(cs) = g.as_mut() {
+                if cs.is_alive() {
+                    cs.back();
+                    return;
+                }
+            }
+        }
+        // Fallback: ADB input
         std::thread::spawn(|| {
             let _ = std::process::Command::new("adb")
                 .args(["-s", "127.0.0.1:6520", "shell", "input", "keyevent", "4"])
@@ -504,100 +513,144 @@ fn setup_input_controllers(
     });
     area.add_controller(right_click);
 
-    // Drag gesture for taps and swipes — uses ADB input (always works)
     let drag = gtk::GestureDrag::new();
     drag.set_button(1);
     let da = display_area.clone();
+    let vw = video_width.clone();
+    let vh = video_height.clone();
+    let c3 = control.clone();
     let af = area.clone();
-
     drag.connect_drag_begin(move |_, x, y| {
         af.grab_focus();
-        if let Some((tx, ty)) = widget_to_display(&da, x, y) {
-            std::thread::spawn(move || {
-                // Use swipe start — send via sendevent for continuous touch
-                let _ = std::process::Command::new("adb")
-                    .args([
-                        "-s",
-                        "127.0.0.1:6520",
-                        "shell",
-                        "input",
-                        "tap",
-                        &tx.to_string(),
-                        &ty.to_string(),
-                    ])
-                    .output();
-            });
-        }
-    });
-
-    area.add_controller(drag);
-
-    // Keyboard input
-    let key = gtk::EventControllerKey::new();
-    key.connect_key_pressed(move |_, keyval, _kc, modifier| {
-        if let Some(ak) = k2a(keyval) {
-            let ak_str = ak.to_string();
-            std::thread::spawn(move || {
-                let _ = std::process::Command::new("adb")
-                    .args([
-                        "-s",
-                        "127.0.0.1:6520",
-                        "shell",
-                        "input",
-                        "keyevent",
-                        &ak_str,
-                    ])
-                    .output();
-            });
-            return glib::Propagation::Stop;
-        }
-        if let Some(ch) = keyval.to_unicode() {
-            if !ch.is_control() {
-                let text = ch.to_string();
+        let (ax, ay) = w2a(
+            &da,
+            x,
+            y,
+            vw.load(Ordering::Relaxed),
+            vh.load(Ordering::Relaxed),
+        );
+        if ax >= 0 && ay >= 0 {
+            let mut used_scrcpy = false;
+            if let Ok(mut g) = c3.lock() {
+                if let Some(cs) = g.as_mut() {
+                    if cs.is_alive() {
+                        cs.touch_down(ax as u32, ay as u32);
+                        used_scrcpy = true;
+                    }
+                }
+            }
+            if !used_scrcpy {
+                // ADB input uses current display coordinates (not portrait-rotated)
+                let rotated = CURRENT_ROTATION.load(Ordering::Relaxed) == 1;
+                let (disp_w, disp_h) = if rotated {
+                    (1280.0, 720.0)
+                } else {
+                    (720.0, 1280.0)
+                };
+                let ww = da.width() as f64;
+                let wh = da.height() as f64;
+                let va = if rotated {
+                    1280.0 / 720.0
+                } else {
+                    720.0 / 1280.0
+                };
+                let wa = ww / wh;
+                let (rw, rh, ox2, oy2) = if va > wa {
+                    (ww, ww / va, 0.0, (wh - ww / va) / 2.0)
+                } else {
+                    (wh * va, wh, (ww - wh * va) / 2.0, 0.0)
+                };
+                let nx = (x - ox2) / rw;
+                let ny = (y - oy2) / rh;
+                let tap_x = (nx * disp_w).round().clamp(0.0, disp_w - 1.0) as u32;
+                let tap_y = (ny * disp_h).round().clamp(0.0, disp_h - 1.0) as u32;
                 std::thread::spawn(move || {
                     let _ = std::process::Command::new("adb")
-                        .args(["-s", "127.0.0.1:6520", "shell", "input", "text", &text])
+                        .args([
+                            "-s",
+                            "127.0.0.1:6520",
+                            "shell",
+                            "input",
+                            "tap",
+                            &tap_x.to_string(),
+                            &tap_y.to_string(),
+                        ])
                         .output();
                 });
-                return glib::Propagation::Stop;
+            }
+        }
+    });
+    let da3 = display_area.clone();
+    let vw3 = video_width.clone();
+    let vh3 = video_height.clone();
+    let c4 = control.clone();
+    drag.connect_drag_update(move |gesture, ox, oy| {
+        if let Some((sx, sy)) = gesture.start_point() {
+            let (ax, ay) = w2a(
+                &da3,
+                sx + ox,
+                sy + oy,
+                vw3.load(Ordering::Relaxed),
+                vh3.load(Ordering::Relaxed),
+            );
+            if ax >= 0 && ay >= 0 {
+                if let Ok(mut g) = c4.lock() {
+                    if let Some(cs) = g.as_mut() {
+                        if cs.is_alive() {
+                            cs.touch_move(ax as u32, ay as u32);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let da4 = display_area.clone();
+    let vw4 = video_width;
+    let vh4 = video_height;
+    let c5 = control.clone();
+    drag.connect_drag_end(move |gesture, ox, oy| {
+        if let Some((sx, sy)) = gesture.start_point() {
+            let (ax, ay) = w2a(
+                &da4,
+                sx + ox,
+                sy + oy,
+                vw4.load(Ordering::Relaxed),
+                vh4.load(Ordering::Relaxed),
+            );
+            if ax >= 0 && ay >= 0 {
+                if let Ok(mut g) = c5.lock() {
+                    if let Some(cs) = g.as_mut() {
+                        if cs.is_alive() {
+                            cs.touch_up(ax as u32, ay as u32);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    area.add_controller(drag);
+
+    let key = gtk::EventControllerKey::new();
+    let c6 = control;
+    key.connect_key_pressed(move |_, keyval, _kc, modifier| {
+        if let Ok(mut g) = c6.lock() {
+            if let Some(cs) = g.as_mut() {
+                if let Some(ak) = k2a(keyval) {
+                    cs.key_meta(ak, m2a(modifier));
+                    return glib::Propagation::Stop;
+                }
+                if let Some(ch) = keyval.to_unicode() {
+                    if !ch.is_control() {
+                        let mut b = [0u8; 4];
+                        cs.inject_text(ch.encode_utf8(&mut b));
+                        return glib::Propagation::Stop;
+                    }
+                }
             }
         }
         glib::Propagation::Proceed
     });
     area.add_controller(key);
-}
-
-/// Map widget coordinates to Android display coordinates (handles rotation).
-fn widget_to_display(w: &impl IsA<gtk::Widget>, wx: f64, wy: f64) -> Option<(u32, u32)> {
-    let ww = w.width() as f64;
-    let wh = w.height() as f64;
-    if ww <= 0.0 || wh <= 0.0 {
-        return None;
-    }
-
-    let rotated = CURRENT_ROTATION.load(Ordering::Relaxed) == 1;
-    let (disp_w, disp_h) = if rotated {
-        (1280.0, 720.0)
-    } else {
-        (720.0, 1280.0)
-    };
-    let va = disp_w / disp_h;
-    let wa = ww / wh;
-    let (rw, rh, ox, oy) = if va > wa {
-        (ww, ww / va, 0.0, (wh - ww / va) / 2.0)
-    } else {
-        (wh * va, wh, (ww - wh * va) / 2.0, 0.0)
-    };
-
-    if wx < ox || wx > ox + rw || wy < oy || wy > oy + rh {
-        return None;
-    }
-
-    let nx = (wx - ox) / rw;
-    let ny = (wy - oy) / rh;
-    let tx = (nx * disp_w).round().clamp(0.0, disp_w - 1.0) as u32;
-    let ty = (ny * disp_h).round().clamp(0.0, disp_h - 1.0) as u32;
-    Some((tx, ty))
 }
 
 /// Current rotation state shared between renderer and input
