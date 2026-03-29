@@ -184,6 +184,9 @@ pub fn start_wayland_display(
             }
             Err(e) => log::error!("display: scrcpy control failed: {e}"),
         }
+
+        // Start scrcpy audio bridge (no video, no control — audio only)
+        start_audio_bridge();
     });
 
     setup_input_controllers(input_area, input_area, video_width, video_height, control);
@@ -545,6 +548,27 @@ pub fn stop_scrcpy(overlay: &gtk::Overlay, handle: &ScrcpyHandle) {
 }
 
 pub fn show_stopped(_overlay: &gtk::Overlay) {}
+
+/// Start scrcpy in audio-only mode — plays Android audio on host via PulseAudio/PipeWire.
+fn start_audio_bridge() {
+    use std::process::{Command, Stdio};
+    match Command::new("scrcpy")
+        .args([
+            "--serial",
+            "127.0.0.1:6520",
+            "--no-video",
+            "--no-control",
+            "--audio-codec=raw",
+            "--audio-buffer=50",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => log::info!("audio: scrcpy audio bridge started (pid={})", child.id()),
+        Err(e) => log::error!("audio: failed to start scrcpy audio bridge: {e}"),
+    }
+}
 
 fn k2a(k: gdk::Key) -> Option<u32> {
     use gdk::Key;

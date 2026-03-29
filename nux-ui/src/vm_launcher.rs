@@ -555,15 +555,40 @@ impl VmLauncher {
         let _ = adb(&["remount"]);
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        // Push Google's ARM64 libc.so (build system filter excludes it from image)
-        let arm64_lib = prebuilts.join("lib64/arm64/libc.so");
-        if arm64_lib.exists() {
+        // Push ALL Google's ARM64 guest libs (build system installs AOSP-built ones
+        // which have different ABIs — berberis needs Google's matching versions)
+        let arm64_dir = prebuilts.join("lib64/arm64");
+        if arm64_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&arm64_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.ends_with(".so") {
+                        let _ = Command::new("adb")
+                            .args(["-s", "127.0.0.1:6520", "push"])
+                            .arg(entry.path())
+                            .arg(format!("/system/lib64/arm64/{name_str}"))
+                            .output();
+                    }
+                }
+            }
+            log::info!("vm: pushed all Google ARM64 guest libs to /system/lib64/arm64/");
+        }
+
+        // Push ARM64 binaries
+        let arm64_bin = prebuilts.join("bin/arm64");
+        if arm64_bin.exists() {
             let _ = Command::new("adb")
                 .args(["-s", "127.0.0.1:6520", "push"])
-                .arg(&arm64_lib)
-                .arg("/system/lib64/arm64/libc.so")
+                .arg(arm64_bin.join("app_process64"))
+                .arg("/system/bin/arm64/app_process64")
                 .output();
-            log::info!("vm: pushed ARM64 libc.so to /system/lib64/arm64/");
+            let _ = Command::new("adb")
+                .args(["-s", "127.0.0.1:6520", "push"])
+                .arg(arm64_bin.join("linker64"))
+                .arg("/system/bin/arm64/linker64")
+                .output();
+            log::info!("vm: pushed ARM64 binaries");
         }
 
         // Delete the 6GB scratch image that adb remount creates
@@ -578,6 +603,18 @@ impl VmLauncher {
 
         // Set SELinux permissive
         let _ = adb(&["shell", "su", "0", "setenforce", "0"]);
+
+        // Regenerate linkerconfig with native bridge paths
+        // The runtime linkerconfig doesn't include arm64 paths for app namespaces
+        let _ = adb(&["shell", "su", "0", "rm", "-rf", "/linkerconfig"]);
+        let _ = adb(&[
+            "shell",
+            "su",
+            "0",
+            "/apex/com.android.runtime/bin/linkerconfig",
+            "--target",
+            "/linkerconfig",
+        ]);
 
         // Mount binfmt_misc and register ARM translation entries
         let _ = adb(&[
