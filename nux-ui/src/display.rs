@@ -66,6 +66,8 @@ struct GlState {
     tex_width: u32,
     tex_height: u32,
     gl_context: gdk::GLContext,
+    /// 0=portrait, 1=landscape (90° CW rotation of content)
+    rotation: u32,
 }
 
 // ── Widget ──
@@ -292,6 +294,7 @@ fn init_gl_state(pic: &gtk::Picture) -> Result<GlState, String> {
         tex_width: 0,
         tex_height: 0,
         gl_context,
+        rotation: 0,
     })
 }
 
@@ -305,36 +308,95 @@ fn upload_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &WaylandFr
     let h = frame.height;
     let data = frame.data();
 
+    // Detect rotation: poll Android's user_rotation setting every ~60 frames
+    static FRAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if count % 60 == 0 {
+        if let Ok(output) = std::process::Command::new("adb")
+            .args([
+                "-s",
+                "127.0.0.1:6520",
+                "shell",
+                "settings",
+                "get",
+                "system",
+                "user_rotation",
+            ])
+            .output()
+        {
+            let rot = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0);
+            if rot != state.rotation {
+                log::info!("display: rotation changed to {rot}");
+                state.rotation = rot;
+            }
+        }
+    }
+
+    // If landscape, rotate pixel data 90° CCW so it displays correctly
+    let (upload_w, upload_h, upload_data);
+    if state.rotation == 1 && w < h {
+        // Rotate 90° CCW: (x,y) -> (y, w-1-x)
+        upload_w = h;
+        upload_h = w;
+        let mut rotated = vec![0u8; (upload_w * upload_h * 4) as usize];
+        let stride_pixels = frame.stride / 4;
+        for y in 0..h {
+            for x in 0..w {
+                let src = ((y * stride_pixels + x) * 4) as usize;
+                let dst_x = y;
+                let dst_y = w - 1 - x;
+                let dst = ((dst_y * upload_w + dst_x) * 4) as usize;
+                if src + 3 < data.len() && dst + 3 < rotated.len() {
+                    rotated[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+                }
+            }
+        }
+        upload_data = Some(rotated);
+    } else {
+        upload_w = w;
+        upload_h = h;
+        upload_data = None;
+    };
+
+    let pixels = upload_data.as_deref().unwrap_or(data);
+
     unsafe {
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (frame.stride / 4) as i32);
+        if upload_data.is_some() {
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, upload_w as i32);
+        } else {
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (frame.stride / 4) as i32);
+        }
         gl.bind_texture(glow::TEXTURE_2D, Some(state.texture));
 
-        if w != state.tex_width || h != state.tex_height {
+        if upload_w != state.tex_width || upload_h != state.tex_height {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
                 glow::RGBA8 as i32,
-                w as i32,
-                h as i32,
+                upload_w as i32,
+                upload_h as i32,
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(data)),
+                glow::PixelUnpackData::Slice(Some(pixels)),
             );
-            state.tex_width = w;
-            state.tex_height = h;
+            state.tex_width = upload_w;
+            state.tex_height = upload_h;
         } else {
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
                 0,
                 0,
                 0,
-                w as i32,
-                h as i32,
+                upload_w as i32,
+                upload_h as i32,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(data)),
+                glow::PixelUnpackData::Slice(Some(pixels)),
             );
         }
 
@@ -342,7 +404,7 @@ fn upload_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &WaylandFr
         gl.flush();
     }
 
-    // Wrap GL texture with GdkGLTextureBuilder — GTK uses it directly
+    // Wrap GL texture with GdkGLTextureBuilder
     let tex_id = state.texture.0.get();
     if let Some(gdk_texture) = build_gl_texture(&state.gl_context, tex_id, w as i32, h as i32) {
         pic.set_paintable(Some(&gdk_texture));
