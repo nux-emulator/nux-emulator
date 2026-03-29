@@ -166,6 +166,10 @@ pub fn start_wayland_display(
         glib::ControlFlow::Continue
     });
 
+    // Scrcpy control for input — with reconnection loop
+    let ctrl = control.clone();
+    let running_ctrl = running.clone();
+
     let handle = ScrcpyHandle {
         running,
         video_width: video_width.clone(),
@@ -173,16 +177,25 @@ pub fn start_wayland_display(
         control: control.clone(),
     };
 
-    // Scrcpy control for input
-    let ctrl = control.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(3));
-        match connect_scrcpy_control() {
-            Ok(c) => {
-                *ctrl.lock().unwrap() = Some(c);
-                log::info!("display: scrcpy control connected");
+
+        // Connect with retry loop (zygote restart kills scrcpy server)
+        loop {
+            if !running_ctrl.load(Ordering::Relaxed) {
+                break;
             }
-            Err(e) => log::error!("display: scrcpy control failed: {e}"),
+            match connect_scrcpy_control() {
+                Ok(c) => {
+                    *ctrl.lock().unwrap() = Some(c);
+                    log::info!("display: scrcpy control connected");
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("display: scrcpy control failed: {e}, retrying in 3s...");
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            }
         }
 
         // Start scrcpy audio bridge (no video, no control — audio only)
@@ -521,6 +534,16 @@ fn w2a(w: &impl IsA<gtk::Widget>, wx: f64, wy: f64, vw: u32, vh: u32) -> (i32, i
 fn connect_scrcpy_control() -> Result<ControlSocket, String> {
     use crate::scrcpy::server;
     server::check_device()?;
+
+    // Get actual screen dimensions (may be rotated)
+    let wm_output = std::process::Command::new("adb")
+        .args(["-s", "127.0.0.1:6520", "shell", "wm", "size"])
+        .output()
+        .map_err(|e| format!("wm size: {e}"))?;
+    let wm_str = String::from_utf8_lossy(&wm_output.stdout);
+    let (sw, sh) = parse_screen_size(&wm_str).unwrap_or((720, 1280));
+    log::info!("display: screen size {}x{}", sw, sh);
+
     let conn = server::ScrcpyConnection::connect(0, 8_000_000)?;
     let mut video = conn.video_stream.try_clone().map_err(|e| format!("{e}"))?;
     std::thread::spawn(move || {
@@ -536,11 +559,21 @@ fn connect_scrcpy_control() -> Result<ControlSocket, String> {
         conn.control_stream
             .try_clone()
             .map_err(|e| format!("{e}"))?,
-        720,
-        1280,
+        sw,
+        sh,
     );
     std::mem::forget(conn);
     Ok(ctrl)
+}
+
+fn parse_screen_size(s: &str) -> Option<(u16, u16)> {
+    // Parse "Physical size: 720x1280" or "Override size: 1280x720"
+    let line = s.lines().last()?;
+    let dims = line.split(':').nth(1)?.trim();
+    let mut parts = dims.split('x');
+    let w = parts.next()?.trim().parse().ok()?;
+    let h = parts.next()?.trim().parse().ok()?;
+    Some((w, h))
 }
 
 pub fn stop_scrcpy(overlay: &gtk::Overlay, handle: &ScrcpyHandle) {
