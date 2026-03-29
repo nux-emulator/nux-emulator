@@ -336,6 +336,7 @@ fn upload_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &WaylandFr
             if rot != state.rotation {
                 log::info!("display: rotation changed to {rot}");
                 state.rotation = rot;
+                CURRENT_ROTATION.store(rot, Ordering::Relaxed);
             }
         }
     }
@@ -589,6 +590,9 @@ fn setup_input_controllers(
     area.add_controller(key);
 }
 
+/// Current rotation state shared between renderer and input
+static CURRENT_ROTATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn w2a(w: &impl IsA<gtk::Widget>, wx: f64, wy: f64, vw: u32, vh: u32) -> (i32, i32) {
     let ww = w.width() as f64;
     let wh = w.height() as f64;
@@ -596,10 +600,12 @@ fn w2a(w: &impl IsA<gtk::Widget>, wx: f64, wy: f64, vw: u32, vh: u32) -> (i32, i
         return (-1, -1);
     }
 
-    // Check rotation state
-    let rotated = vw > vh; // landscape if width > height (after our rotation)
+    let rotated = CURRENT_ROTATION.load(Ordering::Relaxed) == 1;
 
-    let va = vw as f64 / vh as f64;
+    // In landscape, the displayed image is rotated (1280x720)
+    let (disp_w, disp_h) = if rotated { (vh, vw) } else { (vw, vh) };
+
+    let va = disp_w as f64 / disp_h as f64;
     let wa = ww / wh;
     let (rw, rh, ox, oy) = if va > wa {
         (ww, ww / va, 0.0, (wh - ww / va) / 2.0)
@@ -610,20 +616,15 @@ fn w2a(w: &impl IsA<gtk::Widget>, wx: f64, wy: f64, vw: u32, vh: u32) -> (i32, i
         return (-1, -1);
     }
 
-    // Normalized position within the rendered area
     let nx = (wx - ox) / rw;
     let ny = (wy - oy) / rh;
 
     if rotated {
-        // Landscape: reverse the 90° CCW rotation
-        // Our rotation: portrait(px,py) → landscape(py, 719-px)
-        // Reverse: portrait_x = 719 - ly, portrait_y = lx
-        // In normalized: ax = (1-ny)*720, ay = nx*1280
+        // Reverse 90° CCW rotation: portrait_x = (1-ny)*720, portrait_y = nx*1280
         let ax = ((1.0 - ny) * 720.0).round().clamp(0.0, 719.0) as i32;
         let ay = (nx * 1280.0).round().clamp(0.0, 1279.0) as i32;
         (ax, ay)
     } else {
-        // Portrait: direct mapping
         let ax = (nx * 720.0).round().clamp(0.0, 719.0) as i32;
         let ay = (ny * 1280.0).round().clamp(0.0, 1279.0) as i32;
         (ax, ay)
