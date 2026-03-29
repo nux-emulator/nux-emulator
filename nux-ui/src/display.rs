@@ -335,72 +335,36 @@ fn upload_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &WaylandFr
         }
     }
 
-    // If landscape, rotate pixel data 90° CCW so it displays correctly
-    let (upload_w, upload_h, upload_data);
-    if state.rotation == 1 && w < h {
-        // Rotate 90° CCW: src(x,y) -> dst(y, w-1-x)
-        upload_w = h;
-        upload_h = w;
-        let src_stride = frame.stride as usize;
-        let dst_stride = (upload_w * 4) as usize;
-        let mut rotated = vec![0u8; dst_stride * upload_h as usize];
-        for y in 0..h as usize {
-            for x in 0..w as usize {
-                let src_off = y * src_stride + x * 4;
-                let dst_x = y;
-                let dst_y = (w as usize) - 1 - x;
-                let dst_off = dst_y * dst_stride + dst_x * 4;
-                if src_off + 3 < data.len() && dst_off + 3 < rotated.len() {
-                    rotated[dst_off] = data[src_off];
-                    rotated[dst_off + 1] = data[src_off + 1];
-                    rotated[dst_off + 2] = data[src_off + 2];
-                    rotated[dst_off + 3] = data[src_off + 3];
-                }
-            }
-        }
-        upload_data = Some(rotated);
-    } else {
-        upload_w = w;
-        upload_h = h;
-        upload_data = None;
-    };
-
-    let pixels = upload_data.as_deref().unwrap_or(data);
-
     unsafe {
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        if upload_data.is_some() {
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, upload_w as i32);
-        } else {
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (frame.stride / 4) as i32);
-        }
+        gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, (frame.stride / 4) as i32);
         gl.bind_texture(glow::TEXTURE_2D, Some(state.texture));
 
-        if upload_w != state.tex_width || upload_h != state.tex_height {
+        if w != state.tex_width || h != state.tex_height {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
                 glow::RGBA8 as i32,
-                upload_w as i32,
-                upload_h as i32,
+                w as i32,
+                h as i32,
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(pixels)),
+                glow::PixelUnpackData::Slice(Some(data)),
             );
-            state.tex_width = upload_w;
-            state.tex_height = upload_h;
+            state.tex_width = w;
+            state.tex_height = h;
         } else {
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
                 0,
                 0,
                 0,
-                upload_w as i32,
-                upload_h as i32,
+                w as i32,
+                h as i32,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(pixels)),
+                glow::PixelUnpackData::Slice(Some(data)),
             );
         }
 
@@ -410,7 +374,38 @@ fn upload_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &WaylandFr
 
     // Wrap GL texture with GdkGLTextureBuilder
     let tex_id = state.texture.0.get();
-    if let Some(gdk_texture) = build_gl_texture(&state.gl_context, tex_id, w as i32, h as i32) {
+
+    if state.rotation == 1 && w < h {
+        // Landscape: create rotated MemoryTexture (GL texture can't be rotated)
+        let src_stride = frame.stride as usize;
+        let rot_w = h as i32;
+        let rot_h = w as i32;
+        let rot_stride = rot_w as usize * 4;
+        let mut rotated = vec![0u8; rot_stride * rot_h as usize];
+
+        for sy in 0..h as usize {
+            for sx in 0..w as usize {
+                let src = sy * src_stride + sx * 4;
+                // 90° CCW: dst(x,y) = src(w-1-y, x) → dst_x=sy, dst_y=w-1-sx
+                let dx = sy;
+                let dy = w as usize - 1 - sx;
+                let dst = dy * rot_stride + dx * 4;
+                rotated[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+            }
+        }
+
+        let bytes = glib::Bytes::from_owned(rotated);
+        let texture = gdk::MemoryTexture::new(
+            rot_w,
+            rot_h,
+            gdk::MemoryFormat::R8g8b8a8Premultiplied,
+            &bytes,
+            rot_stride,
+        );
+        pic.set_paintable(Some(&texture));
+    } else if let Some(gdk_texture) =
+        build_gl_texture(&state.gl_context, tex_id, w as i32, h as i32)
+    {
         pic.set_paintable(Some(&gdk_texture));
     }
 }
