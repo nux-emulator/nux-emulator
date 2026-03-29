@@ -166,7 +166,7 @@ pub fn start_wayland_display(
         glib::ControlFlow::Continue
     });
 
-    // Scrcpy control for input — with reconnection loop
+    // Scrcpy control for input — with continuous reconnection
     let ctrl = control.clone();
     let running_ctrl = running.clone();
 
@@ -180,7 +180,10 @@ pub fn start_wayland_display(
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(3));
 
-        // Connect with retry loop (zygote restart kills scrcpy server)
+        // Start audio bridge once
+        start_audio_bridge();
+
+        // Continuous reconnection loop
         loop {
             if !running_ctrl.load(Ordering::Relaxed) {
                 break;
@@ -189,17 +192,27 @@ pub fn start_wayland_display(
                 Ok(c) => {
                     *ctrl.lock().unwrap() = Some(c);
                     log::info!("display: scrcpy control connected");
-                    break;
+
+                    // Monitor the connection — wait until it breaks
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        if !running_ctrl.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        // Check if control socket is still alive by checking the lock
+                        let alive = ctrl.lock().unwrap().is_some();
+                        if !alive {
+                            break;
+                        }
+                    }
                 }
                 Err(e) => {
                     log::warn!("display: scrcpy control failed: {e}, retrying in 3s...");
-                    std::thread::sleep(std::time::Duration::from_secs(3));
                 }
             }
+            *ctrl.lock().unwrap() = None;
+            std::thread::sleep(std::time::Duration::from_secs(3));
         }
-
-        // Start scrcpy audio bridge (no video, no control — audio only)
-        start_audio_bridge();
     });
 
     setup_input_controllers(input_area, input_area, video_width, video_height, control);
