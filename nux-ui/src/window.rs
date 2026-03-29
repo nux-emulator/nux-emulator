@@ -49,7 +49,9 @@ impl NuxWindow {
         // ── Header bar ───────────────────────────────────────────
         let status_label = gtk::Label::builder()
             .label("Stopped")
-            .css_classes(["dim-label"])
+            .css_classes(["status-overlay"])
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
             .build();
 
         let fps_label = gtk::Label::builder()
@@ -66,7 +68,6 @@ impl NuxWindow {
             .build();
 
         let header_bar = adw::HeaderBar::new();
-        header_bar.pack_start(&status_label);
         header_bar.pack_end(&menu_button);
         header_bar.pack_end(&fps_label);
 
@@ -76,6 +77,9 @@ impl NuxWindow {
 
         // Add keymap overlay on top of the display
         display_widget.add_overlay(&keymap_overlay_widget);
+
+        // Add status label overlay on the display
+        display_widget.add_overlay(&status_label);
 
         // ── APK drop overlay (visual feedback) ───────────────────
         let drop_overlay = gtk::Box::builder()
@@ -628,6 +632,7 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                 if !nux_clone.state.vm_booted.get() {
                     nux_clone.state.vm_booted.set(true);
                     nux_clone.status_label.set_label("Running");
+                    nux_clone.status_label.set_visible(false);
                     nux_clone
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));

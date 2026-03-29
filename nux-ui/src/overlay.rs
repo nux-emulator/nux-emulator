@@ -37,6 +37,14 @@ pub fn build_keymap_overlay() -> gtk::Fixed {
             border-radius: 50%;
             min-width: 48px;
             min-height: 48px;
+        }
+        .status-overlay {
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            border-radius: 12px;
+            padding: 16px 32px;
+            font-size: 18px;
+            font-weight: bold;
         }",
     );
     gtk::style_context_add_provider_for_display(

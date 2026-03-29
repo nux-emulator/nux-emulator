@@ -558,8 +558,9 @@ fn start_audio_bridge() {
             "127.0.0.1:6520",
             "--no-video",
             "--no-control",
+            "--no-window",
             "--audio-codec=raw",
-            "--audio-buffer=50",
+            "--audio-buffer=20",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
