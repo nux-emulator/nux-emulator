@@ -273,6 +273,7 @@ impl VmLauncher {
                 "--report_anonymous_usage_stats=n",
                 "--enable_sandbox=false",
                 "--netsim=false",
+                "--enable_gpu_udmabuf=true",
                 "--blank_data_image_mb=16384",
             ])
             .env(
@@ -378,6 +379,7 @@ impl VmLauncher {
             "--gpu=displays=[[mode=windowed[720,1280],dpi=[320,320],refresh-rate=60]],\
              context-types=gfxstream-gles:gfxstream-vulkan:gfxstream-composer,\
              pci-address=00:02.0,egl=true,surfaceless=true,glx=false,gles=true,\
+             udmabuf=true,\
              renderer-features=\"GlProgramBinaryLinkStatus:enabled\"",
         );
 

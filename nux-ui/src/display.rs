@@ -18,7 +18,7 @@ use std::sync::{
 };
 
 use crate::scrcpy::control::ControlSocket;
-use crate::wayland_compositor::{FrameData, WaylandFrame};
+use crate::wayland_compositor::{DmabufFrame, FrameData, WaylandFrame};
 
 // ── Types ──
 
@@ -68,7 +68,45 @@ struct GlState {
     gl_context: gdk::GLContext,
     /// 0=portrait, 1=landscape (90° CW rotation of content)
     rotation: u32,
+    /// EGL display for DMA-BUF import (null if not available)
+    egl_display: *mut std::ffi::c_void,
+    /// eglCreateImageKHR function pointer
+    egl_create_image: Option<EglCreateImageFn>,
+    /// eglDestroyImageKHR function pointer
+    egl_destroy_image: Option<EglDestroyImageFn>,
+    /// glEGLImageTargetTexture2DOES function pointer
+    gl_egl_image_target: Option<GlEglImageTargetFn>,
+    /// Current EGL image (destroyed on next frame)
+    current_egl_image: *mut std::ffi::c_void,
+    /// Separate texture for DMA-BUF import
+    dmabuf_texture: Option<glow::Texture>,
 }
+
+// EGL constants
+const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
+const EGL_WIDTH: u32 = 0x3057;
+const EGL_HEIGHT: u32 = 0x3056;
+const EGL_LINUX_DRM_FOURCC_EXT: u32 = 0x3271;
+const EGL_DMA_BUF_PLANE0_FD_EXT: u32 = 0x3272;
+const EGL_DMA_BUF_PLANE0_OFFSET_EXT: u32 = 0x3273;
+const EGL_DMA_BUF_PLANE0_PITCH_EXT: u32 = 0x3274;
+const EGL_NONE: i32 = 0x3038;
+const EGL_NO_CONTEXT: *mut std::ffi::c_void = std::ptr::null_mut();
+const EGL_NO_IMAGE: *mut std::ffi::c_void = std::ptr::null_mut();
+const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
+
+type EglCreateImageFn = unsafe extern "C" fn(
+    dpy: *mut std::ffi::c_void,
+    ctx: *mut std::ffi::c_void,
+    target: u32,
+    buffer: *mut std::ffi::c_void,
+    attrib_list: *const i32,
+) -> *mut std::ffi::c_void;
+
+type EglDestroyImageFn =
+    unsafe extern "C" fn(dpy: *mut std::ffi::c_void, image: *mut std::ffi::c_void) -> u32;
+
+type GlEglImageTargetFn = unsafe extern "C" fn(target: u32, image: *mut std::ffi::c_void);
 
 // ── Widget ──
 
@@ -97,6 +135,66 @@ pub fn build_display() -> (gtk::Overlay, gtk::DrawingArea) {
 }
 
 // ── Display start ──
+
+/// Start input controllers + scrcpy control + audio (no video rendering).
+/// Used when WebRTC handles video but we still need input via scrcpy.
+pub fn start_input_only(input_area: &gtk::DrawingArea) -> ScrcpyHandle {
+    let running = Arc::new(AtomicBool::new(true));
+    let video_width = Arc::new(AtomicU32::new(720));
+    let video_height = Arc::new(AtomicU32::new(1280));
+    let control: Arc<Mutex<Option<ControlSocket>>> = Arc::new(Mutex::new(None));
+
+    let ctrl = control.clone();
+    let running_ctrl = running.clone();
+
+    let handle = ScrcpyHandle {
+        running,
+        video_width: video_width.clone(),
+        video_height: video_height.clone(),
+        control: control.clone(),
+    };
+
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        start_audio_bridge();
+
+        loop {
+            if !running_ctrl.load(Ordering::Relaxed) {
+                break;
+            }
+            match connect_scrcpy_control() {
+                Ok(c) => {
+                    *ctrl.lock().unwrap() = Some(c);
+                    log::info!("display: scrcpy control connected (input-only)");
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        if !running_ctrl.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let alive = ctrl
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map_or(false, |cs| cs.is_alive());
+                        if !alive {
+                            log::info!("display: scrcpy control died, will reconnect");
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("display: scrcpy control failed: {e}, retrying in 3s...");
+                }
+            }
+            *ctrl.lock().unwrap() = None;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    });
+
+    setup_input_controllers(input_area, input_area, video_width, video_height, control);
+    log::info!("display: input controllers attached (input-only mode)");
+    handle
+}
 
 pub fn start_wayland_display(
     overlay: &gtk::Overlay,
@@ -129,25 +227,40 @@ pub fn start_wayland_display(
         if let Some(frame_data) = frame_slot.take() {
             rc2.set(rc2.get() + 1);
 
-            if let FrameData::Shm(frame) = frame_data {
-                vw2.store(frame.width, Ordering::Relaxed);
-                vh2.store(frame.height, Ordering::Relaxed);
-
-                if gs.borrow().is_none() {
-                    match init_gl_state(&pic) {
-                        Ok(state) => {
-                            log::info!("display: GL texture renderer initialized");
-                            *gs.borrow_mut() = Some(state);
-                        }
-                        Err(e) => {
-                            log::error!("display: GL init failed: {e}");
-                            return glib::ControlFlow::Continue;
-                        }
+            // Initialize GL state lazily on first frame
+            if gs.borrow().is_none() {
+                match init_gl_state(&pic) {
+                    Ok(state) => {
+                        log::info!("display: GL texture renderer initialized");
+                        *gs.borrow_mut() = Some(state);
+                    }
+                    Err(e) => {
+                        log::error!("display: GL init failed: {e}");
+                        return glib::ControlFlow::Continue;
                     }
                 }
+            }
 
-                if let Some(state) = gs.borrow_mut().as_mut() {
-                    upload_and_present(state, &pic, &frame);
+            match frame_data {
+                FrameData::Shm(frame) => {
+                    vw2.store(frame.width, Ordering::Relaxed);
+                    vh2.store(frame.height, Ordering::Relaxed);
+
+                    if let Some(state) = gs.borrow_mut().as_mut() {
+                        upload_and_present(state, &pic, &frame);
+                    }
+                }
+                FrameData::Dmabuf(frame) => {
+                    vw2.store(frame.width, Ordering::Relaxed);
+                    vh2.store(frame.height, Ordering::Relaxed);
+
+                    if let Some(state) = gs.borrow_mut().as_mut() {
+                        if init_egl_dmabuf(state) {
+                            dmabuf_import_and_present(state, &pic, &frame);
+                        } else {
+                            log::warn!("display: DMA-BUF import not available, frame dropped");
+                        }
+                    }
                 }
             }
         }
@@ -247,7 +360,7 @@ fn init_gl_state(pic: &gtk::Picture) -> Result<GlState, String> {
                 std::mem::transmute(libc::dlsym(egl, b"eglGetProcAddress\0".as_ptr().cast()));
             glow::Context::from_loader_function(|name| {
                 let c = std::ffi::CString::new(name).unwrap();
-                unsafe { f(c.as_ptr()) }
+                f(c.as_ptr())
             })
         } else {
             let glx = libc::dlopen(
@@ -262,7 +375,7 @@ fn init_gl_state(pic: &gtk::Picture) -> Result<GlState, String> {
                 std::mem::transmute(libc::dlsym(glx, b"glXGetProcAddressARB\0".as_ptr().cast()));
             glow::Context::from_loader_function(|name| {
                 let c = std::ffi::CString::new(name).unwrap();
-                unsafe { f(c.as_ptr().cast()) }
+                f(c.as_ptr().cast())
             })
         }
     };
@@ -300,7 +413,154 @@ fn init_gl_state(pic: &gtk::Picture) -> Result<GlState, String> {
         tex_height: 0,
         gl_context,
         rotation: 0,
+        egl_display: std::ptr::null_mut(),
+        egl_create_image: None,
+        egl_destroy_image: None,
+        gl_egl_image_target: None,
+        current_egl_image: EGL_NO_IMAGE,
+        dmabuf_texture: None,
     })
+}
+
+/// Initialize EGL DMA-BUF import functions (called lazily on first dmabuf frame).
+fn init_egl_dmabuf(state: &mut GlState) -> bool {
+    if state.egl_create_image.is_some() {
+        return true; // already initialized
+    }
+
+    unsafe {
+        let egl_lib = libc::dlopen(
+            b"libEGL.so.1\0".as_ptr().cast(),
+            libc::RTLD_LAZY | libc::RTLD_NOLOAD,
+        );
+        if egl_lib.is_null() {
+            log::error!("display: EGL not available for DMA-BUF import");
+            return false;
+        }
+
+        type GetProcFn = unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_void;
+        let get_proc: GetProcFn =
+            std::mem::transmute(libc::dlsym(egl_lib, b"eglGetProcAddress\0".as_ptr().cast()));
+
+        type GetDisplayFn = unsafe extern "C" fn() -> *mut std::ffi::c_void;
+        let get_current_display: GetDisplayFn =
+            std::mem::transmute(get_proc(b"eglGetCurrentDisplay\0".as_ptr().cast()));
+        let egl_display = get_current_display();
+        if egl_display.is_null() {
+            log::error!("display: no current EGL display for DMA-BUF import");
+            return false;
+        }
+
+        let create_image: *mut std::ffi::c_void = get_proc(b"eglCreateImageKHR\0".as_ptr().cast());
+        let destroy_image: *mut std::ffi::c_void =
+            get_proc(b"eglDestroyImageKHR\0".as_ptr().cast());
+        let image_target: *mut std::ffi::c_void =
+            get_proc(b"glEGLImageTargetTexture2DOES\0".as_ptr().cast());
+
+        if create_image.is_null() || destroy_image.is_null() || image_target.is_null() {
+            log::error!(
+                "display: EGL DMA-BUF extensions not available (create={} destroy={} target={})",
+                !create_image.is_null(),
+                !destroy_image.is_null(),
+                !image_target.is_null()
+            );
+            return false;
+        }
+
+        // Create a dedicated texture for DMA-BUF import (GL_TEXTURE_EXTERNAL_OES)
+        let tex = state.gl.create_texture().unwrap();
+        state.gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, Some(tex));
+        state.gl.tex_parameter_i32(
+            GL_TEXTURE_EXTERNAL_OES,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        state.gl.tex_parameter_i32(
+            GL_TEXTURE_EXTERNAL_OES,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+
+        state.egl_display = egl_display;
+        state.egl_create_image = Some(std::mem::transmute(create_image));
+        state.egl_destroy_image = Some(std::mem::transmute(destroy_image));
+        state.gl_egl_image_target = Some(std::mem::transmute(image_target));
+        state.dmabuf_texture = Some(tex);
+
+        log::info!("display: EGL DMA-BUF import initialized (zero-copy GPU rendering)");
+        true
+    }
+}
+
+/// Import DMA-BUF fd as GL texture and present — zero CPU copy.
+fn dmabuf_import_and_present(state: &mut GlState, pic: &gtk::Picture, frame: &DmabufFrame) {
+    state.gl_context.make_current();
+
+    // Destroy previous EGL image
+    if state.current_egl_image != EGL_NO_IMAGE {
+        if let Some(destroy) = state.egl_destroy_image {
+            unsafe {
+                destroy(state.egl_display, state.current_egl_image);
+            }
+        }
+        state.current_egl_image = EGL_NO_IMAGE;
+    }
+
+    let attribs: [i32; 13] = [
+        EGL_WIDTH as i32,
+        frame.width as i32,
+        EGL_HEIGHT as i32,
+        frame.height as i32,
+        EGL_LINUX_DRM_FOURCC_EXT as i32,
+        frame.fourcc as i32,
+        EGL_DMA_BUF_PLANE0_FD_EXT as i32,
+        frame.fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT as i32,
+        frame.offset as i32,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT as i32,
+        frame.stride as i32,
+        EGL_NONE,
+    ];
+
+    let create = state.egl_create_image.unwrap();
+    let image_target = state.gl_egl_image_target.unwrap();
+    let tex = state.dmabuf_texture.unwrap();
+
+    unsafe {
+        let image = create(
+            state.egl_display,
+            EGL_NO_CONTEXT,
+            EGL_LINUX_DMA_BUF_EXT,
+            std::ptr::null_mut(), // no client buffer
+            attribs.as_ptr(),
+        );
+
+        if image == EGL_NO_IMAGE {
+            log::error!(
+                "display: eglCreateImageKHR failed for DMA-BUF fd={}",
+                frame.fd
+            );
+            return;
+        }
+
+        state.current_egl_image = image;
+
+        // Bind the EGL image to our texture
+        state.gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, Some(tex));
+        image_target(GL_TEXTURE_EXTERNAL_OES, image);
+        state.gl.flush();
+    }
+
+    // Present via GdkGLTextureBuilder
+    let tex_id = tex.0.get();
+    if let Some(gdk_texture) = build_gl_texture(
+        &state.gl_context,
+        tex_id,
+        frame.width as i32,
+        frame.height as i32,
+    ) {
+        pic.set_paintable(Some(&gdk_texture));
+    }
 }
 
 // ── Upload + present via GdkGLTextureBuilder ──
@@ -638,8 +898,8 @@ fn setup_input_controllers(
         // Convert scroll to swipe: scroll down = swipe up on screen
         let ww = da5.width() as f64;
         let wh = da5.height() as f64;
-        let cx = (ww / 2.0) as u32;
-        let cy = (wh / 2.0) as u32;
+        let _cx = (ww / 2.0) as u32;
+        let _cy = (wh / 2.0) as u32;
         let distance = (dy * 200.0) as i32; // 200px per scroll tick
 
         let rotated = CURRENT_ROTATION.load(Ordering::Relaxed) == 1;
@@ -797,7 +1057,7 @@ fn parse_screen_size(s: &str) -> Option<(u16, u16)> {
     Some((w, h))
 }
 
-pub fn stop_scrcpy(overlay: &gtk::Overlay, handle: &ScrcpyHandle) {
+pub fn stop_scrcpy(_overlay: &gtk::Overlay, handle: &ScrcpyHandle) {
     handle.stop();
 }
 

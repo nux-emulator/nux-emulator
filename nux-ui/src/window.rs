@@ -351,13 +351,14 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
 
             std::thread::spawn(move || {
                 let frames_sock = "/tmp/cf_avd_0/cvd-1/internal/frames.sock";
+                let use_webrtc = std::env::var("NUX_WEBRTC").is_ok_and(|v| v == "1");
 
                 // Start launch_cvd normally — don't interfere with socket creation
                 let result = launcher.start();
 
                 // After launch_cvd starts, watch for crosvm process.
                 // Crosvm takes ~2s to init gfxstream before connecting to Wayland.
-                // In that window: kill webRTC, replace socket with ours.
+                // In that window: replace socket with ours (unless WebRTC mode).
                 if result.is_ok() {
                     // Wait for crosvm to appear (up to 60s)
                     let mut found = false;
@@ -374,7 +375,7 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
 
-                    if found {
+                    if found && !use_webrtc {
                         log::info!("vm: crosvm detected, swapping Wayland socket");
 
                         // DON'T kill webRTC — process_monitor detects the exit
@@ -399,6 +400,10 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                                 log::error!("vm: Wayland compositor failed: {e}");
                             }
                         }
+                    } else if found && use_webrtc {
+                        log::info!(
+                            "vm: crosvm detected, skipping Wayland socket swap (WebRTC mode)"
+                        );
                     } else {
                         log::error!("vm: crosvm not detected after 60s");
                     }
@@ -465,6 +470,10 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                 display::stop_scrcpy(&nux.display_widget, handle);
             }
             *nux.state.scrcpy.borrow_mut() = None;
+            // Stop WebRTC pipeline if active
+            if let Some(pipeline) = nux.state.webrtc_pipeline.borrow_mut().take() {
+                crate::webrtc_display::stop_pipeline(&pipeline);
+            }
             display::show_stopped(&nux.display_widget);
             set_vm_action_sensitivity(&nux, false);
             nux.toast_overlay.add_toast(adw::Toast::new("VM stopped"));
@@ -718,35 +727,73 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         let _ = launcher2.setup_arm_translation();
                     }
 
-                    // Use Wayland compositor for native display
-                    let display_handle = if let Some(frame_slot) =
-                        nux_clone.state.wayland_frame_slot.borrow_mut().take()
-                    {
-                        let wayland_input = nux_clone.state.wayland_input.borrow_mut().take();
-                        if let Some(wl_input) = wayland_input {
-                            log::info!("display: using native Wayland compositor");
+                    // Try WebRTC display if enabled (GPU→GPU via NVDEC), fall back to Wayland
+                    // Set NUX_WEBRTC=1 to enable WebRTC display (experimental)
+                    let use_webrtc = std::env::var("NUX_WEBRTC").is_ok_and(|v| v == "1");
+                    let mut used_webrtc = false;
+
+                    if use_webrtc {
+                        let picture = nux_clone
+                            .display_widget
+                            .child()
+                            .and_then(|w| w.downcast::<gtk::Picture>().ok());
+
+                        if let Some(ref pic) = picture {
+                            let running =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                            match crate::webrtc_display::start_webrtc_display(pic, running) {
+                                Ok(pipeline) => {
+                                    log::info!("display: using WebRTC (NVDEC hardware decode)");
+                                    nux_clone
+                                        .toast_overlay
+                                        .add_toast(adw::Toast::new("WebRTC display connected"));
+                                    *nux_clone.state.webrtc_pipeline.borrow_mut() = Some(pipeline);
+                                    used_webrtc = true;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "display: WebRTC failed: {e}, falling back to Wayland"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if used_webrtc {
+                        // WebRTC handles video; start input-only (scrcpy control + audio)
+                        let display_handle = display::start_input_only(&nux_clone.input_area);
+                        *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
+                    } else {
+                        // Wayland compositor for native display
+                        let display_handle = if let Some(frame_slot) =
+                            nux_clone.state.wayland_frame_slot.borrow_mut().take()
+                        {
+                            let wayland_input = nux_clone.state.wayland_input.borrow_mut().take();
+                            if let Some(wl_input) = wayland_input {
+                                log::info!("display: using native Wayland compositor");
+                                nux_clone
+                                    .toast_overlay
+                                    .add_toast(adw::Toast::new("Native display connected"));
+                                display::start_wayland_display(
+                                    &nux_clone.display_widget,
+                                    &nux_clone.input_area,
+                                    &nux_clone.window,
+                                    frame_slot,
+                                    wl_input,
+                                )
+                            } else {
+                                log::error!("display: no Wayland input handle");
+                                return glib::ControlFlow::Continue;
+                            }
+                        } else {
+                            log::error!("display: no Wayland frame receiver available");
                             nux_clone
                                 .toast_overlay
-                                .add_toast(adw::Toast::new("Native display connected"));
-                            display::start_wayland_display(
-                                &nux_clone.display_widget,
-                                &nux_clone.input_area,
-                                &nux_clone.window,
-                                frame_slot,
-                                wl_input,
-                            )
-                        } else {
-                            log::error!("display: no Wayland input handle");
+                                .add_toast(adw::Toast::new("Display connection failed"));
                             return glib::ControlFlow::Continue;
-                        }
-                    } else {
-                        log::error!("display: no Wayland frame receiver available");
-                        nux_clone
-                            .toast_overlay
-                            .add_toast(adw::Toast::new("Display connection failed"));
-                        return glib::ControlFlow::Continue;
-                    };
-                    *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
+                        };
+                        *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
+                    }
                 }
                 glib::ControlFlow::Continue
             }

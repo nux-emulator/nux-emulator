@@ -47,6 +47,7 @@ impl WaylandFrame {
 /// Frame types — either shm pixels or dmabuf handle.
 pub enum FrameData {
     Shm(WaylandFrame),
+    #[allow(dead_code)]
     Dmabuf(DmabufFrame),
 }
 
@@ -205,6 +206,7 @@ fn millis() -> u32 {
 struct SurfaceData {
     buffer: Mutex<Option<wl_buffer::WlBuffer>>,
 }
+#[allow(dead_code)]
 struct ShmPoolData {
     fd: Arc<OwnedFd>,
     len: usize,
@@ -213,7 +215,7 @@ struct ShmPoolData {
 }
 
 /// Persistent mmap of a shm pool. Unmapped on drop.
-struct PoolMmap {
+pub(crate) struct PoolMmap {
     ptr: *mut u8,
     len: usize,
 }
@@ -261,6 +263,7 @@ struct DmabufPlane {
     fd: OwnedFd,
     offset: u32,
     stride: u32,
+    modifier: u64,
 }
 
 /// A DMA-BUF backed buffer.
@@ -274,6 +277,7 @@ struct DmabufBufferData {
 
 /// DMA-BUF frame metadata sent to UI thread (no pixel copy needed).
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct DmabufFrame {
     pub fd: std::os::fd::RawFd,
     pub width: u32,
@@ -741,11 +745,11 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, DmabufData> for Compositor 
 impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsData> for Compositor {
     fn request(
         _: &mut Self,
-        _: &Client,
+        client: &Client,
         r: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
         req: zwp_linux_buffer_params_v1::Request,
         data: &DmabufParamsData,
-        _: &DisplayHandle,
+        dh: &DisplayHandle,
         di: &mut DataInit<'_, Self>,
     ) {
         match req {
@@ -754,15 +758,17 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                 plane_idx: _,
                 offset,
                 stride,
-                modifier_hi: _,
-                modifier_lo: _,
+                modifier_hi,
+                modifier_lo,
             } => {
                 let owned =
                     unsafe { OwnedFd::from_raw_fd(nix::unistd::dup(fd.as_raw_fd()).unwrap()) };
+                let modifier = ((modifier_hi as u64) << 32) | (modifier_lo as u64);
                 data.planes.lock().unwrap().push(DmabufPlane {
                     fd: owned,
                     offset,
                     stride,
+                    modifier,
                 });
             }
             zwp_linux_buffer_params_v1::Request::CreateImmed {
@@ -798,9 +804,43 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                 format,
                 flags: _,
             } => {
-                // Create is async — for now just fail, CreateImmed is preferred
-                log::warn!("wayland: dmabuf Create (async) not supported, use CreateImmed");
-                r.failed();
+                // Async Create — crosvm uses this path.
+                // Create a wl_buffer and send it back via the `created` event.
+                let planes = std::mem::take(&mut *data.planes.lock().unwrap());
+                if planes.is_empty() {
+                    r.failed();
+                    return;
+                }
+
+                let modifier = planes.first().map_or(0, |p| p.modifier);
+
+                log::info!(
+                    "wayland: dmabuf buffer created (async) {width}x{height} fourcc=0x{format:08x} modifier=0x{modifier:x} planes={}",
+                    planes.len()
+                );
+
+                let buffer_data = DmabufBufferData {
+                    planes,
+                    width,
+                    height,
+                    fourcc: format,
+                    modifier,
+                };
+
+                // Create the wl_buffer resource for the client
+                match client.create_resource::<wl_buffer::WlBuffer, DmabufBufferData, Self>(
+                    dh,
+                    1,
+                    buffer_data,
+                ) {
+                    Ok(buffer) => {
+                        r.created(&buffer);
+                    }
+                    Err(e) => {
+                        log::error!("wayland: failed to create dmabuf buffer resource: {e}");
+                        r.failed();
+                    }
+                }
             }
             _ => {}
         }

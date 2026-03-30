@@ -24,12 +24,14 @@ pub struct UiState {
     pub pre_fs_height: Cell<i32>,
     /// VM launcher instance.
     pub launcher: Arc<VmLauncher>,
-    /// Display handle.
+    /// Display handle (scrcpy control for input).
     pub scrcpy: RefCell<Option<ScrcpyHandle>>,
     /// Wayland frame slot (set before VM boot, consumed on boot).
     pub wayland_frame_slot: RefCell<Option<Arc<FrameSlot>>>,
     /// Wayland input handle for sending pointer/keyboard events to crosvm.
     pub wayland_input: RefCell<Option<WaylandInput>>,
+    /// WebRTC GStreamer pipeline (if using WebRTC display).
+    pub webrtc_pipeline: RefCell<Option<gstreamer::Pipeline>>,
 }
 
 impl Default for UiState {
@@ -45,6 +47,7 @@ impl Default for UiState {
             scrcpy: RefCell::new(None),
             wayland_frame_slot: RefCell::new(None),
             wayland_input: RefCell::new(None),
+            webrtc_pipeline: RefCell::new(None),
         }
     }
 }
