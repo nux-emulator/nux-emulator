@@ -1,11 +1,8 @@
-//! WebRTC display client for Cuttlefish.
+//! WebRTC display client for Cuttlefish (experimental, NUX_WEBRTC=1).
 //!
 //! Connects to the Cuttlefish WebRTC signaling server (port 8443),
-//! negotiates a WebRTC session, and renders the H.264 video stream
-//! via GStreamer: `webrtcbin → nvh264dec → gtk4paintablesink`.
-//!
-//! This gives GPU→GPU rendering (NVDEC hardware decode) instead of
-//! the Wayland compositor's CPU round-trip (GPU→CPU→GPU via wl_shm).
+//! negotiates a WebRTC session, and renders the video stream via
+//! GStreamer: `webrtcbin → rtpvp9depay → vp9dec → videoconvert → appsink`.
 //!
 //! Cuttlefish signaling protocol (polling mode):
 //!   1. POST /connect       {device_id}              → {connection_id}
@@ -131,8 +128,6 @@ struct SessionState {
 
 /// Start the WebRTC display. Returns a GStreamer pipeline handle.
 ///
-/// Pipeline: webrtcbin → rtph264depay → h264parse → nvh264dec → videoconvert → gtk4paintablesink
-///
 /// Verifies signaling server connectivity synchronously before building the
 /// pipeline. Returns Err if the server is unreachable.
 pub fn start_webrtc_display(
@@ -142,7 +137,7 @@ pub fn start_webrtc_display(
     // Verify signaling server is reachable BEFORE building the pipeline.
     let http = make_agent();
     let conn_id = signaling_connect(&http)?;
-    log::info!("webrtc: signaling connected, connection_id={conn_id}");
+    log::info!("webrtc: signaling connected");
 
     gst::init().map_err(|e| format!("GStreamer init: {e}"))?;
 
@@ -164,7 +159,6 @@ pub fn start_webrtc_display(
         .build()
         .map_err(|e| format!("appsink: {e}"))?;
 
-    // Request RGBA format so we can upload directly to GdkMemoryTexture
     let caps = gst::Caps::builder("video/x-raw")
         .field("format", "RGBA")
         .build();
@@ -173,7 +167,6 @@ pub fn start_webrtc_display(
     appsink.set_property("max-buffers", 2u32);
     appsink.set_property("sync", true);
 
-    // Shared frame slot: appsink callback writes, GTK timer reads
     let frame_slot: Arc<Mutex<Option<WebRtcFrame>>> = Arc::new(Mutex::new(None));
     let frame_slot_writer = frame_slot.clone();
 
@@ -207,7 +200,6 @@ pub fn start_webrtc_display(
 
     let sink = app_sink.upcast::<gst::Element>();
 
-    // Pre-create shared elements (convert + queue + sink are codec-independent)
     let convert = gst::ElementFactory::make("videoconvert")
         .name("convert")
         .build()
@@ -223,7 +215,6 @@ pub fn start_webrtc_display(
     gst::Element::link_many([&convert, &queue, &sink])
         .map_err(|e| format!("link convert→queue→sink: {e}"))?;
 
-    // Start GTK timer to poll frames and render
     start_frame_renderer(picture, frame_slot);
 
     // Dynamic pad linking — detect codec from RTP caps and build decode chain
@@ -244,7 +235,6 @@ pub fn start_webrtc_display(
             return;
         }
 
-        // Already linked?
         let convert_sink = convert_clone.static_pad("sink").unwrap();
         if convert_sink.is_linked() {
             return;
@@ -254,7 +244,6 @@ pub fn start_webrtc_display(
             return;
         };
 
-        // Detect codec from RTP caps
         let encoding = caps
             .structure(0)
             .and_then(|s| s.get::<&str>("encoding-name").ok())
@@ -262,17 +251,13 @@ pub fn start_webrtc_display(
 
         let (depay, _decoder) = match encoding {
             "H264" => {
-                let nvdec_available = gst::ElementFactory::find("nvh264dec").is_some();
-                let decoder_name = if nvdec_available {
-                    "nvh264dec"
-                } else {
-                    "avdec_h264"
-                };
-                log::info!("webrtc: H264 stream, using {decoder_name}");
+                let nvdec = gst::ElementFactory::find("nvh264dec").is_some();
+                let dec_name = if nvdec { "nvh264dec" } else { "avdec_h264" };
+                log::info!("webrtc: H264 stream, decoder={dec_name}");
 
                 let depay = gst::ElementFactory::make("rtph264depay").build().unwrap();
                 let parse = gst::ElementFactory::make("h264parse").build().unwrap();
-                let dec = gst::ElementFactory::make(decoder_name).build().unwrap();
+                let dec = gst::ElementFactory::make(dec_name).build().unwrap();
 
                 pipeline.add_many([&depay, &parse, &dec]).unwrap();
                 gst::Element::link_many([&depay, &parse, &dec]).unwrap();
@@ -281,16 +266,13 @@ pub fn start_webrtc_display(
                 for e in [&depay, &parse, &dec] {
                     let _ = e.sync_state_with_parent();
                 }
-
                 (depay, dec)
             }
             "VP9" => {
-                // Use software VP9 decoder for now (nvvp9dec has CUDA memory issues)
-                let decoder_name = "vp9dec";
-                log::info!("webrtc: VP9 stream, using {decoder_name}");
+                log::info!("webrtc: VP9 stream, decoder=vp9dec");
 
                 let depay = gst::ElementFactory::make("rtpvp9depay").build().unwrap();
-                let dec = gst::ElementFactory::make(decoder_name).build().unwrap();
+                let dec = gst::ElementFactory::make("vp9dec").build().unwrap();
 
                 pipeline.add_many([&depay, &dec]).unwrap();
                 depay.link(&dec).unwrap();
@@ -299,11 +281,10 @@ pub fn start_webrtc_display(
                 for e in [&depay, &dec] {
                     let _ = e.sync_state_with_parent();
                 }
-
                 (depay, dec)
             }
             _ => {
-                log::info!("webrtc: {encoding} stream, using software vp8dec");
+                log::info!("webrtc: {encoding} stream, decoder=vp8dec");
 
                 let depay = gst::ElementFactory::make("rtpvp8depay").build().unwrap();
                 let dec = gst::ElementFactory::make("vp8dec").build().unwrap();
@@ -315,7 +296,6 @@ pub fn start_webrtc_display(
                 for e in [&depay, &dec] {
                     let _ = e.sync_state_with_parent();
                 }
-
                 (depay, dec)
             }
         };
@@ -335,16 +315,9 @@ pub fn start_webrtc_display(
         let mline_index = values[1].get::<u32>().unwrap();
         let candidate = values[2].get::<String>().unwrap();
 
-        // Skip empty end-of-candidates signal
         if candidate.is_empty() {
-            log::info!("webrtc: ICE gathering complete");
             return None;
         }
-
-        log::info!(
-            "webrtc: local ICE candidate mline={mline_index}: {}",
-            &candidate[..candidate.len().min(120)]
-        );
 
         if let Ok(guard) = session_ice.lock() {
             if let Some(sess) = guard.as_ref() {
@@ -364,19 +337,12 @@ pub fn start_webrtc_display(
         None
     });
 
-    // Monitor ICE connection state
+    // Monitor connection state
     webrtcbin.connect_notify(Some("ice-connection-state"), |webrtc, _| {
         let state = webrtc.property::<gst_webrtc::WebRTCICEConnectionState>("ice-connection-state");
-        log::info!("webrtc: ICE connection state: {state:?}");
+        log::info!("webrtc: ICE state: {state:?}");
     });
 
-    // Monitor overall connection state
-    webrtcbin.connect_notify(Some("connection-state"), |webrtc, _| {
-        let state = webrtc.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
-        log::info!("webrtc: peer connection state: {state:?}");
-    });
-
-    // Monitor data channel — device adds video after data channel opens
     webrtcbin.connect("on-data-channel", false, move |values| {
         let channel = values[1]
             .get::<gst::glib::Object>()
@@ -386,18 +352,12 @@ pub fn start_webrtc_display(
         None
     });
 
-    // Monitor overall connection state
-    webrtcbin.connect_notify(Some("connection-state"), |webrtc, _| {
-        let state = webrtc.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
-        log::info!("webrtc: peer connection state: {state:?}");
-    });
-
     // Start pipeline
     pipeline
         .set_state(gst::State::Playing)
         .map_err(|e| format!("pipeline start: {e}"))?;
 
-    // Signaling thread — reuse the pre-verified connection
+    // Signaling thread
     let webrtc_clone = webrtcbin.clone();
     let pipeline_clone = pipeline.clone();
 
@@ -424,9 +384,6 @@ fn handle_device_messages(
     session: &Arc<Mutex<Option<SessionState>>>,
     got_offer: &mut bool,
 ) -> Result<(), String> {
-    if !messages.is_empty() {
-        log::info!("webrtc: received {} device message(s)", messages.len());
-    }
     for msg in messages {
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -438,7 +395,6 @@ fn handle_device_messages(
                     .ok_or("no sdp in offer")?;
 
                 log::info!("webrtc: received SDP offer ({} bytes)", sdp_str.len());
-                log::info!("webrtc: offer SDP:\n{sdp_str}");
 
                 let sdp = gst_sdp::SDPMessage::parse_buffer(sdp_str.as_bytes())
                     .map_err(|e| format!("parse offer SDP: {e}"))?;
@@ -447,11 +403,9 @@ fn handle_device_messages(
                     sdp,
                 );
 
-                // Set remote description (the offer from device)
                 webrtcbin
                     .emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
 
-                // Create answer
                 let (answer_tx, answer_rx) = std::sync::mpsc::channel();
                 let promise = gst::Promise::with_change_func(move |reply| {
                     let sdp = reply.ok().flatten().and_then(|s| {
@@ -469,15 +423,12 @@ fn handle_device_messages(
                     .map_err(|_| "timeout creating answer".to_string())?
                     .ok_or("failed to create answer")?;
 
-                // Set local description
                 webrtcbin.emit_by_name::<()>(
                     "set-local-description",
                     &[&answer_sdp, &None::<gst::Promise>],
                 );
 
-                // Send answer to device
                 let answer_text = answer_sdp.sdp().to_string();
-                log::info!("webrtc: answer SDP:\n{answer_text}");
                 if let Ok(guard) = session.lock() {
                     if let Some(sess) = guard.as_ref() {
                         let answer_msg = serde_json::json!({
@@ -492,15 +443,9 @@ fn handle_device_messages(
                 *got_offer = true;
             }
             "ice-candidate" => {
-                // Device sends: {type: "ice-candidate", candidate: "...", mid: "...", mLineIndex: N}
                 let candidate = msg.get("candidate").and_then(|v| v.as_str()).unwrap_or("");
                 let sdp_mline_index =
                     msg.get("mLineIndex").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-
-                log::info!(
-                    "webrtc: device ICE candidate mline={sdp_mline_index}: {}",
-                    &candidate[..candidate.len().min(120)]
-                );
                 webrtcbin.emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
             }
             "error" => {
@@ -511,7 +456,7 @@ fn handle_device_messages(
                 log::error!("webrtc: device error: {error}");
             }
             _ => {
-                log::info!("webrtc: unknown message type: {msg_type}, full: {msg}");
+                log::debug!("webrtc: unknown message type: {msg_type}");
             }
         }
     }
@@ -527,13 +472,11 @@ fn run_signaling(
     http: ureq::Agent,
     conn_id: String,
 ) -> Result<(), String> {
-    // Store session for ICE candidate forwarding
     *session.lock().unwrap() = Some(SessionState {
         agent: http.clone(),
         conn_id: conn_id.clone(),
     });
 
-    // Step 1: Request offer from device (Cuttlefish protocol — device creates the offer)
     log::info!("webrtc: requesting offer from device");
     let initial_messages = signaling_forward(
         &http,
@@ -544,12 +487,9 @@ fn run_signaling(
         }),
     )?;
 
-    // Process any immediate responses
     let mut got_offer = false;
     handle_device_messages(&initial_messages, &webrtcbin, &session, &mut got_offer)?;
 
-    // Poll continuously — device sends renegotiation offers (with video) after
-    // the data channel opens. We must keep handling "offer" messages forever.
     let mut poll_count = 0u64;
     while running.load(Ordering::Relaxed) {
         let messages = signaling_poll(&http, &conn_id).unwrap_or_default();
