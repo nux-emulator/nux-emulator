@@ -15,6 +15,15 @@ use crate::toolbar;
 
 use crate::vm_launcher::BootStatus;
 
+/// Helper to set the headerbar subtitle (status text).
+fn set_status(header_bar: &adw::HeaderBar, text: &str) {
+    if let Some(title_widget) = header_bar.title_widget() {
+        if let Ok(wt) = title_widget.downcast::<adw::WindowTitle>() {
+            wt.set_subtitle(text);
+        }
+    }
+}
+
 /// Events sent from background threads to the UI thread.
 #[allow(dead_code)]
 enum VmEvent {
@@ -28,7 +37,6 @@ pub struct NuxWindow {
     pub window: adw::ApplicationWindow,
     pub toast_overlay: adw::ToastOverlay,
     pub header_bar: adw::HeaderBar,
-    pub status_label: gtk::Label,
     pub fps_label: gtk::Label,
     pub sidebar: gtk::Box,
     pub keymap_overlay_widget: gtk::Fixed,
@@ -47,13 +55,6 @@ impl NuxWindow {
         let state = Rc::new(UiState::default());
 
         // ── Header bar ───────────────────────────────────────────
-        let status_label = gtk::Label::builder()
-            .label("Stopped")
-            .css_classes(["status-overlay"])
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .build();
-
         let fps_label = gtk::Label::builder()
             .label("0 FPS")
             .visible(false)
@@ -68,6 +69,12 @@ impl NuxWindow {
             .build();
 
         let header_bar = adw::HeaderBar::new();
+        header_bar.set_title_widget(Some(
+            &adw::WindowTitle::builder()
+                .title("Nux Emulator")
+                .subtitle("Stopped")
+                .build(),
+        ));
         header_bar.pack_end(&menu_button);
         header_bar.pack_end(&fps_label);
 
@@ -77,9 +84,6 @@ impl NuxWindow {
 
         // Add keymap overlay on top of the display
         display_widget.add_overlay(&keymap_overlay_widget);
-
-        // Add status label overlay on the display
-        display_widget.add_overlay(&status_label);
 
         // ── APK drop overlay (visual feedback) ───────────────────
         let drop_overlay = gtk::Box::builder()
@@ -125,10 +129,10 @@ impl NuxWindow {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Nux Emulator")
-            .default_width(1024)
-            .default_height(768)
-            .width_request(800)
-            .height_request(600)
+            .default_width(360)
+            .default_height(120)
+            .width_request(300)
+            .height_request(80)
             .content(&content)
             .build();
 
@@ -137,7 +141,6 @@ impl NuxWindow {
             window: window.clone(),
             toast_overlay,
             header_bar,
-            status_label,
             fps_label,
             sidebar,
             keymap_overlay_widget,
@@ -338,9 +341,9 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                 return;
             }
 
-            nux.status_label.set_label("Starting...");
             nux.toast_overlay
                 .add_toast(adw::Toast::new("Starting VM..."));
+            set_status(&nux.header_bar, "Starting...");
 
             let launcher = nux.state.launcher.clone();
             let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -424,13 +427,13 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                 match rx.try_recv() {
                     Ok(Ok(())) => {
                         nux_clone.state.vm_running.set(true);
-                        nux_clone.status_label.set_label("Booting...");
+                        set_status(&nux_clone.header_bar, "Booting...");
                         set_vm_action_sensitivity(&nux_clone, true);
                         start_boot_monitor(&nux_clone);
                         glib::ControlFlow::Break
                     }
                     Ok(Err(e)) => {
-                        nux_clone.status_label.set_label("Failed");
+                        set_status(&nux_clone.header_bar, "Failed");
                         nux_clone
                             .toast_overlay
                             .add_toast(adw::Toast::new(&format!("VM start failed: {e}")));
@@ -438,7 +441,7 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        nux_clone.status_label.set_label("Failed");
+                        set_status(&nux_clone.header_bar, "Failed");
                         glib::ControlFlow::Break
                     }
                 }
@@ -459,12 +462,12 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                 return;
             }
 
-            nux.status_label.set_label("Stopping...");
+            set_status(&nux.header_bar, "Stopping...");
             let launcher = nux.state.launcher.clone();
             let _ = launcher.stop();
             nux.state.vm_running.set(false);
             nux.state.vm_booted.set(false);
-            nux.status_label.set_label("Stopped");
+            set_status(&nux.header_bar, "Stopped");
             // Stop scrcpy display
             if let Some(handle) = nux.state.scrcpy.borrow().as_ref() {
                 display::stop_scrcpy(&nux.display_widget, handle);
@@ -712,104 +715,32 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
             BootStatus::Booted => {
                 if !nux_clone.state.vm_booted.get() {
                     nux_clone.state.vm_booted.set(true);
-                    nux_clone.status_label.set_label("Running");
-                    nux_clone.status_label.set_visible(false);
+                    set_status(&nux_clone.header_bar, "Running");
                     nux_clone
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
-                    // Enable WiFi and ARM translation in background
-                    // ARM translation: SELinux permissive + binfmt_misc + zygote restart
-                    // Must complete BEFORE scrcpy connects (zygote restart kills it)
-                    {
-                        let launcher2 = launcher.clone();
-                        let _ = launcher2.enable_wifi();
-                        let _ = launcher2.setup_arm_translation();
-                    }
-
-                    // Try WebRTC display if enabled (GPU→GPU via NVDEC), fall back to Wayland
-                    // Set NUX_WEBRTC=1 to enable WebRTC display (experimental)
-                    let use_webrtc = std::env::var("NUX_WEBRTC").is_ok_and(|v| v == "1");
-                    let mut used_webrtc = false;
-
-                    if use_webrtc {
-                        let picture = nux_clone
-                            .display_widget
-                            .child()
-                            .and_then(|w| w.downcast::<gtk::Picture>().ok());
-
-                        if let Some(ref pic) = picture {
-                            let running =
-                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-                            match crate::webrtc_display::start_webrtc_display(pic, running) {
-                                Ok(pipeline) => {
-                                    log::info!("display: using WebRTC (NVDEC hardware decode)");
-                                    nux_clone
-                                        .toast_overlay
-                                        .add_toast(adw::Toast::new("WebRTC display connected"));
-                                    *nux_clone.state.webrtc_pipeline.borrow_mut() = Some(pipeline);
-                                    used_webrtc = true;
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "display: WebRTC failed: {e}, falling back to Wayland"
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    if used_webrtc {
-                        // WebRTC handles video; start input-only (scrcpy control + audio)
-                        let display_handle = display::start_input_only(&nux_clone.input_area);
-                        *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
-                    } else {
-                        // Wayland compositor for native display
-                        let display_handle = if let Some(frame_slot) =
-                            nux_clone.state.wayland_frame_slot.borrow_mut().take()
-                        {
-                            let wayland_input = nux_clone.state.wayland_input.borrow_mut().take();
-                            if let Some(wl_input) = wayland_input {
-                                log::info!("display: using native Wayland compositor");
-                                nux_clone
-                                    .toast_overlay
-                                    .add_toast(adw::Toast::new("Native display connected"));
-                                display::start_wayland_display(
-                                    &nux_clone.display_widget,
-                                    &nux_clone.input_area,
-                                    &nux_clone.window,
-                                    frame_slot,
-                                    wl_input,
-                                )
-                            } else {
-                                log::error!("display: no Wayland input handle");
-                                return glib::ControlFlow::Continue;
-                            }
-                        } else {
-                            log::error!("display: no Wayland frame receiver available");
-                            nux_clone
-                                .toast_overlay
-                                .add_toast(adw::Toast::new("Display connection failed"));
-                            return glib::ControlFlow::Continue;
-                        };
-                        *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
-                    }
+                    // ARM translation + WiFi are baked into the AOSP image
+                    // (init.nux.rc + arm-translation.mk), no runtime setup needed.
+                    // Start scrcpy control + audio + X11 input bridge.
+                    let display_handle = display::start_input_only(&nux_clone.input_area);
+                    *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
                 }
                 glib::ControlFlow::Continue
             }
             BootStatus::Booting => {
-                nux_clone.status_label.set_label("Booting...");
+                set_status(&nux_clone.header_bar, "Booting...");
                 glib::ControlFlow::Continue
             }
             BootStatus::NotConnected => {
                 if !nux_clone.state.launcher.is_running() {
                     nux_clone.state.vm_running.set(false);
                     nux_clone.state.vm_booted.set(false);
-                    nux_clone.status_label.set_label("Stopped");
+                    set_status(&nux_clone.header_bar, "Stopped");
                     set_vm_action_sensitivity(&nux_clone, false);
                     return glib::ControlFlow::Break;
                 }
-                nux_clone.status_label.set_label("Starting...");
+                set_status(&nux_clone.header_bar, "Starting...");
                 glib::ControlFlow::Continue
             }
         }
