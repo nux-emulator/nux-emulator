@@ -191,8 +191,18 @@ pub fn start_input_only(input_area: &gtk::DrawingArea) -> ScrcpyHandle {
         }
     });
 
-    setup_input_controllers(input_area, input_area, video_width, video_height, control);
+    setup_input_controllers(
+        input_area,
+        input_area,
+        video_width,
+        video_height,
+        control.clone(),
+    );
     log::info!("display: input controllers attached (input-only mode)");
+
+    // Start X11 input bridge for the GPU-rendered window
+    crate::x11_input::start_x11_input_bridge(control, handle.running.clone());
+
     handle
 }
 
@@ -335,8 +345,18 @@ pub fn start_wayland_display(
         }
     });
 
-    setup_input_controllers(input_area, input_area, video_width, video_height, control);
+    setup_input_controllers(
+        input_area,
+        input_area,
+        video_width,
+        video_height,
+        control.clone(),
+    );
     log::info!("display: input controllers attached");
+
+    // Start X11 input bridge for the GPU-rendered window
+    crate::x11_input::start_x11_input_bridge(control, handle.running.clone());
+
     handle
 }
 

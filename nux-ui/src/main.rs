@@ -11,6 +11,7 @@ mod wayland_compositor;
 mod wayland_protocol;
 mod webrtc_display;
 mod window;
+mod x11_input;
 
 use adw::prelude::*;
 use gtk::glib;
