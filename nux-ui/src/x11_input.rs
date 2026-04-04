@@ -306,7 +306,10 @@ fn run_input_loop(
     running: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     // Wait for the window ID file to appear
-    let id_path = "/tmp/nux-cf/cuttlefish/instances/cvd-1/internal/x11_window_id";
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let id_path = format!(
+        "{home}/.local/share/nux-emulator/cuttlefish/instances/cvd-1/internal/x11_window_id"
+    );
     let mut window_id: Window = 0;
     let mut fb_w: i32 = 720;
     let mut fb_h: i32 = 1280;
@@ -316,7 +319,7 @@ fn run_input_loop(
         if !running.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if let Ok(content) = std::fs::read_to_string(id_path) {
+        if let Ok(content) = std::fs::read_to_string(&id_path) {
             let parts: Vec<&str> = content.trim().split_whitespace().collect();
             if parts.len() >= 3 {
                 window_id = parts[0].parse().unwrap_or(0);

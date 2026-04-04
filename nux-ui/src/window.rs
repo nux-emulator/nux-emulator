@@ -355,14 +355,12 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             std::thread::spawn(move || {
                 let frames_sock = "/tmp/cf_avd_0/cvd-1/internal/frames.sock";
 
-                // Start launch_cvd normally — don't interfere with socket creation
+                // Always use launch_cvd — it manages all services
+                // (adb_connector, process_monitor, etc.).
+                // Our patched assemble_cvd preserves disk images with --resume.
                 let result = launcher.start();
 
-                // After launch_cvd starts, watch for crosvm process.
-                // Crosvm takes ~2s to init gfxstream before connecting to Wayland.
-                // In that window: replace socket with ours.
                 if result.is_ok() {
-                    // Wait for crosvm to appear (up to 60s)
                     let mut found = false;
                     for _ in 0..600 {
                         let out = std::process::Command::new("pgrep")
@@ -380,16 +378,10 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                     if found {
                         log::info!("vm: crosvm detected, swapping Wayland socket");
 
-                        // DON'T kill webRTC — process_monitor detects the exit
-                        // and shuts down the entire VM. webRTC already has its fd,
-                        // it doesn't need the socket file.
-
-                        // Make the directory writable so we can bind our socket as non-root
                         let _ = std::process::Command::new("sudo")
                             .args(["chmod", "777", "/tmp/cf_avd_0/cvd-1/internal"])
                             .output();
 
-                        // Remove the old socket and bind ours
                         let _ = std::fs::remove_file(frames_sock);
                         std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -864,6 +856,12 @@ fn setup_close_handler(nux: &Rc<NuxWindow>) {
         move |_win| {
             // Save window state
             save_window_state(&nux);
+
+            // Graceful VM shutdown (flushes filesystem, preserves data)
+            if nux.state.vm_running.get() {
+                log::info!("window: closing — initiating graceful VM shutdown");
+                let _ = nux.state.launcher.stop();
+            }
 
             if nux.state.apk_installing.get() {
                 // Show confirmation dialog
