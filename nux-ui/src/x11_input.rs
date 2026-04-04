@@ -104,6 +104,7 @@ unsafe extern "C" {
     fn XCloseDisplay(display: Display) -> i32;
     fn XLookupKeysym(event: *mut XEvent, index: i32) -> KeySym;
     fn XConnectionNumber(display: Display) -> i32;
+    fn XUnmapWindow(display: Display, window: Window) -> i32;
     fn XCreateWindow(
         display: Display,
         parent: Window,
@@ -321,7 +322,33 @@ fn run_input_loop(
         anyhow::bail!("XOpenDisplay failed");
     }
 
-    // Get parent window size
+    // Wait for scrcpy control to connect before creating the input overlay.
+    // The parent window is unmapped until the ready signal, so we must wait
+    // for it to be mapped before creating child windows on it.
+    log::info!("x11-input: waiting for scrcpy control...");
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            unsafe {
+                XCloseDisplay(display);
+            }
+            return Ok(());
+        }
+        let has_control = control
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|cs| cs.is_alive()))
+            .unwrap_or(false);
+        if has_control {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    log::info!("x11-input: scrcpy connected, setting up input overlay");
+
+    // Small delay to let X11Presenter map the window after seeing the ready file
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Get parent window size (now that it's mapped)
     let mut parent_attrs: XWindowAttributes = unsafe { std::mem::zeroed() };
     unsafe {
         XGetWindowAttributes(display, window_id, &mut parent_attrs);

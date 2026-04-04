@@ -720,11 +720,37 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
-                    // ARM translation + WiFi are baked into the AOSP image
-                    // (init.nux.rc + arm-translation.mk), no runtime setup needed.
-                    // Start scrcpy control + audio + X11 input bridge.
-                    let display_handle = display::start_input_only(&nux_clone.input_area);
-                    *nux_clone.state.scrcpy.borrow_mut() = Some(display_handle);
+                    // ARM translation must complete before scrcpy starts,
+                    // because zygote restart kills the scrcpy server.
+                    // WiFi is handled by init.nux.rc (boot_completed trigger).
+                    let (arm_tx, arm_rx) = std::sync::mpsc::channel::<()>();
+                    {
+                        let launcher2 = launcher.clone();
+                        std::thread::spawn(move || {
+                            let _ = launcher2.enable_wifi();
+                            let _ = launcher2.setup_arm_translation();
+                            let _ = arm_tx.send(());
+                        });
+                    }
+
+                    // Poll for ARM setup completion, then start scrcpy
+                    let nux2 = nux_clone.clone();
+                    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+                        match arm_rx.try_recv() {
+                            Ok(()) => {
+                                let dh = display::start_input_only(&nux2.input_area);
+                                *nux2.state.scrcpy.borrow_mut() = Some(dh);
+                                glib::ControlFlow::Break
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                glib::ControlFlow::Continue
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                log::error!("ARM setup thread died");
+                                glib::ControlFlow::Break
+                            }
+                        }
+                    });
                 }
                 glib::ControlFlow::Continue
             }

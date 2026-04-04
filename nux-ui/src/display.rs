@@ -166,6 +166,12 @@ pub fn start_input_only(input_area: &gtk::DrawingArea) -> ScrcpyHandle {
                 Ok(c) => {
                     *ctrl.lock().unwrap() = Some(c);
                     log::info!("display: scrcpy control connected (input-only)");
+
+                    // Signal X11Presenter that input is ready — it will map the window
+                    let ready_path = "/tmp/nux-x11-ready";
+                    if std::fs::write(ready_path, "1").is_ok() {
+                        log::info!("display: wrote X11 ready signal");
+                    }
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         if !running_ctrl.load(Ordering::Relaxed) {

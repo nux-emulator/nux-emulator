@@ -248,6 +248,7 @@ impl VmLauncher {
                 &format!("{}/cuttlefish", self.config.home_dir.display()),
                 "/tmp/cf_avd_0",
                 "/tmp/cf_env_0",
+                "/tmp/nux-x11-ready",
             ])
             .output();
         std::fs::create_dir_all(&self.config.home_dir).ok();
@@ -316,6 +317,9 @@ impl VmLauncher {
         let _ = Command::new("sudo")
             .args(["pkill", "-9", "-f", "crosvm|process_restarter|secure_env"])
             .output();
+        let _ = Command::new("pkill")
+            .args(["-9", "-f", "crosvm|process_restarter|secure_env"])
+            .output();
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         self.setup_networking().ok();
@@ -334,7 +338,7 @@ impl VmLauncher {
             ));
         }
 
-        // Create internal directory and log files (needs sudo since dir is root-owned)
+        // Create internal directory and log files
         let _ = Command::new("sudo")
             .args(["mkdir", "-p", &internal_dir.to_string_lossy()])
             .output();
@@ -345,7 +349,7 @@ impl VmLauncher {
         let crosvm_log = internal_dir.join("crosvm.log");
         let crosvm_err = internal_dir.join("crosvm_err.log");
 
-        // Create log files as root
+        // Create log files
         for f in [&kernel_log, &logcat_log, &crosvm_log, &crosvm_err] {
             let _ = Command::new("sudo")
                 .args(["touch", &f.to_string_lossy()])
@@ -492,9 +496,14 @@ impl VmLauncher {
 
     /// Stop the VM.
     pub fn stop(&self) -> Result<(), String> {
-        // Kill all crosvm-related processes
+        // Kill all crosvm-related processes (sudo for any leftover root-owned processes)
         let _ = Command::new("sudo")
             .args(["pkill", "-9", "-f",
+                "launch_cvd|run_cvd|crosvm|process_restarter|secure_env|log_tee|netsimd|wmediumd|webrtc|webRTC|casimir|modem_sim"])
+            .output();
+        // Also kill user-owned ones
+        let _ = Command::new("pkill")
+            .args(["-9", "-f",
                 "launch_cvd|run_cvd|crosvm|process_restarter|secure_env|log_tee|netsimd|wmediumd|webrtc|webRTC|casimir|modem_sim"])
             .output();
 
