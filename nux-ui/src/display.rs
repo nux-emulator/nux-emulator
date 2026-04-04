@@ -117,6 +117,34 @@ pub fn start_input_only(input_area: &gtk::DrawingArea) -> ScrcpyHandle {
                     if std::fs::write(ready_path, "1").is_ok() {
                         log::info!("display: wrote X11 ready signal");
                     }
+
+                    // Start orientation polling in a separate thread
+                    let running_orient = running_ctrl.clone();
+                    std::thread::spawn(move || {
+                        let orient_path = "/tmp/nux-x11-orientation";
+                        let mut last_orient = 255u8; // invalid initial
+                        while running_orient.load(Ordering::Relaxed) {
+                            if let Ok(output) = std::process::Command::new("adb")
+                                .args(["-s", "127.0.0.1:6520", "shell", "dumpsys", "display"])
+                                .output()
+                            {
+                                let out = String::from_utf8_lossy(&output.stdout);
+                                if let Some(orient) = out
+                                    .lines()
+                                    .find(|l| l.contains("mCurrentOrientation="))
+                                    .and_then(|l| l.trim().strip_prefix("mCurrentOrientation="))
+                                    .and_then(|s| s.parse::<u8>().ok())
+                                {
+                                    if orient != last_orient {
+                                        let _ = std::fs::write(orient_path, orient.to_string());
+                                        last_orient = orient;
+                                        log::info!("display: orientation changed to {orient}");
+                                    }
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                    });
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         if !running_ctrl.load(Ordering::Relaxed) {

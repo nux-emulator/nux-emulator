@@ -249,6 +249,7 @@ impl VmLauncher {
                 "/tmp/cf_avd_0",
                 "/tmp/cf_env_0",
                 "/tmp/nux-x11-ready",
+                "/tmp/nux-x11-orientation",
             ])
             .output();
         std::fs::create_dir_all(&self.config.home_dir).ok();
