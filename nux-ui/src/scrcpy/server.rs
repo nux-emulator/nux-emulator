@@ -12,7 +12,7 @@ use std::time::Duration;
 const SCRCPY_SERVER_PATH: &str = "/usr/share/scrcpy/scrcpy-server";
 const DEVICE_SERVER_PATH: &str = "/data/local/tmp/scrcpy-server.jar";
 const ADB_SERIAL: &str = "127.0.0.1:6520";
-const SCRCPY_VERSION: &str = "3.3.4";
+const SCRCPY_VERSION: &str = "4.0";
 
 /// Active scrcpy connection with video + control streams.
 pub struct ScrcpyConnection {

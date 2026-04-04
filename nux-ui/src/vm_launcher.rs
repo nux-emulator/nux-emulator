@@ -21,9 +21,12 @@ pub struct VmLaunchConfig {
 
 impl Default for VmLaunchConfig {
     fn default() -> Self {
+        // Persistent HOME — survives restarts, preserves data partition
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let persistent_home = PathBuf::from(&home).join(".local/share/nux-emulator");
         Self {
             aosp_root: PathBuf::from("/build2/nux-emulator/nux-android-image/aosp"),
-            home_dir: PathBuf::from("/tmp/nux-cf"),
+            home_dir: persistent_home,
             gpu_mode: "gfxstream".to_owned(),
             cpus: 8,
             memory_mb: 8192,
@@ -252,20 +255,7 @@ impl VmLauncher {
             ])
             .output();
 
-        // Preserve the cuttlefish instance directory (contains persistent data image).
-        // Only clean runtime files, not disk images.
-        let instance_dir = self.config.home_dir.join("cuttlefish/instances/cvd-1");
-        if instance_dir.exists() {
-            // Clean runtime sockets/locks but keep disk images
-            let _ = Command::new("sudo")
-                .args([
-                    "rm",
-                    "-rf",
-                    &format!("{}/internal", instance_dir.display()),
-                    &format!("{}/logs", instance_dir.display()),
-                ])
-                .output();
-        }
+        // Persistent HOME — don't wipe cuttlefish directory.
         std::fs::create_dir_all(&self.config.home_dir).ok();
 
         // Run pre-launch hook (bind Wayland compositor here)
@@ -288,17 +278,25 @@ impl VmLauncher {
             "--enable_sandbox=false",
             "--netsim=false",
             "--enable_gpu_udmabuf=true",
+            "--resume=true",
         ]);
 
-        // Only create a blank data image on first run (no existing instance).
-        // On subsequent runs, launch_cvd reuses the existing data partition,
-        // preserving installed apps and game progress.
-        let instance_dir = self.config.home_dir.join("cuttlefish/instances/cvd-1");
-        if !instance_dir.join("overlay.img").exists() {
-            log::info!("vm: first run — creating 64GB data partition");
-            cmd.arg("--blank_data_image_mb=65536");
+        // Persistent data: check if instance-local userdata.img exists.
+        // First run: force creation of instance-local userdata.img (65GB).
+        // Subsequent runs: reuse it as-is.
+        let instance_userdata = self
+            .config
+            .home_dir
+            .join("cuttlefish/instances/cvd-1/userdata.img");
+        if instance_userdata.exists() {
+            log::info!(
+                "vm: reusing persistent userdata.img ({})",
+                instance_userdata.display()
+            );
+            cmd.arg("--data_policy=use_existing");
         } else {
-            log::info!("vm: reusing existing data partition (persistent storage)");
+            log::info!("vm: first run — creating 65GB data partition");
+            cmd.args(["--data_policy=always_create", "--blank_data_image_mb=65536"]);
         }
         cmd.env(
             "DISPLAY",
@@ -514,23 +512,69 @@ impl VmLauncher {
         log::info!("vm: crosvm started directly (pid={})", child.id());
 
         *self.process.lock().unwrap() = Some(child);
+
+        // Start adb_connector to bridge vsock to TCP port 6520.
+        // In launch_cvd mode this is done automatically; in direct mode we do it.
+        let adb_connector = host_out.join("bin/adb_connector");
+        let home_dir2 = self.config.home_dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            log::info!("vm: starting adb_connector (vsock:3:5555 → TCP 6520)...");
+            let child = Command::new("sudo")
+                .arg("-E")
+                .arg(&adb_connector)
+                .arg("--addresses=vsock:3:5555")
+                .arg("--adb_port=6520")
+                .env("HOME", &home_dir2)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match child {
+                Ok(_) => log::info!("vm: adb_connector started"),
+                Err(e) => log::error!("vm: adb_connector failed: {e}"),
+            }
+        });
+
         Ok(())
     }
 
-    /// Stop the VM.
+    /// Stop the VM gracefully, then force-kill if needed.
     pub fn stop(&self) -> Result<(), String> {
-        // Kill all crosvm-related processes (sudo for any leftover root-owned processes)
+        // Step 1: Sync filesystem inside the guest
+        let _ = self.adb_shell(&["sync"]);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Step 2: Kill crosvm with SIGTERM (flushes QCOW2 write cache cleanly).
+        // Do NOT use stop_cvd — it invalidates disk state.
+        // Do NOT use adb reboot -p — process_restarter keeps crosvm alive.
+        log::info!("vm: sending SIGTERM to crosvm (flushes QCOW2)...");
         let _ = Command::new("sudo")
-            .args(["pkill", "-9", "-f",
-                "launch_cvd|run_cvd|crosvm|process_restarter|secure_env|log_tee|netsimd|wmediumd|webrtc|webRTC|casimir|modem_sim"])
-            .output();
-        // Also kill user-owned ones
-        let _ = Command::new("pkill")
-            .args(["-9", "-f",
-                "launch_cvd|run_cvd|crosvm|process_restarter|secure_env|log_tee|netsimd|wmediumd|webrtc|webRTC|casimir|modem_sim"])
+            .args(["pkill", "-TERM", "-f", "crosvm.*crosvm_control"])
             .output();
 
+        // Wait for crosvm to exit (up to 15s)
+        for i in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let out = Command::new("pgrep")
+                .args(["-f", "crosvm.*crosvm_control"])
+                .output();
+            if let Ok(o) = out {
+                if !o.status.success() || o.stdout.is_empty() {
+                    log::info!("vm: crosvm exited cleanly (took {}s)", (i + 1) / 2);
+                    break;
+                }
+            }
+        }
+
+        // Step 3: Kill remaining infrastructure
+        let _ = Command::new("sudo")
+            .args(["pkill", "-9", "-f",
+                "launch_cvd|run_cvd|process_restarter|secure_env|log_tee|netsimd|wmediumd|webrtc|webRTC|casimir|modem_sim"])
+            .output();
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
         *self.process.lock().unwrap() = None;
+        log::info!("vm: shutdown complete");
         Ok(())
     }
 
@@ -693,23 +737,23 @@ impl VmLauncher {
     }
 
     /// Check if ADB is connected and boot is complete.
+    /// Tries TCP (127.0.0.1:6520) first, falls back to any connected device
+    /// (direct crosvm mode uses vsock which appears as USB device).
     pub fn check_boot_status(&self) -> BootStatus {
-        let connect = Command::new("adb")
+        // Try TCP first (launch_cvd mode)
+        let _ = Command::new("adb")
             .args(["connect", "127.0.0.1:6520"])
             .output();
 
-        if connect.is_err() {
-            return BootStatus::NotConnected;
-        }
+        // Find a working device serial
+        let serial = self.find_adb_device();
+        let serial = match serial {
+            Some(s) => s,
+            None => return BootStatus::NotConnected,
+        };
 
         let output = Command::new("adb")
-            .args([
-                "-s",
-                "127.0.0.1:6520",
-                "shell",
-                "getprop",
-                "sys.boot_completed",
-            ])
+            .args(["-s", &serial, "shell", "getprop", "sys.boot_completed"])
             .output();
 
         match output {
@@ -723,6 +767,49 @@ impl VmLauncher {
             }
             Err(_) => BootStatus::NotConnected,
         }
+    }
+
+    /// Run an ADB shell command, auto-detecting the device serial.
+    fn adb_shell(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        let serial = self
+            .find_adb_device()
+            .ok_or_else(|| "No ADB device found".to_string())?;
+        Command::new("adb")
+            .args(["-s", &serial, "shell"])
+            .args(args)
+            .output()
+            .map_err(|e| format!("adb shell failed: {e}"))
+    }
+
+    /// Run an ADB command (non-shell), auto-detecting the device serial.
+    fn adb_cmd(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        let serial = self
+            .find_adb_device()
+            .ok_or_else(|| "No ADB device found".to_string())?;
+        Command::new("adb")
+            .args(["-s", &serial])
+            .args(args)
+            .output()
+            .map_err(|e| format!("adb failed: {e}"))
+    }
+
+    /// Find a working ADB device serial (TCP or USB/vsock).
+    fn find_adb_device(&self) -> Option<String> {
+        let output = Command::new("adb").args(["devices"]).output().ok()?;
+        let devices = String::from_utf8_lossy(&output.stdout);
+        // Prefer 127.0.0.1:6520 if available
+        for line in devices.lines() {
+            if line.contains("127.0.0.1:6520") && line.contains("device") {
+                return Some("127.0.0.1:6520".to_string());
+            }
+        }
+        // Fall back to any connected device (vsock/USB)
+        for line in devices.lines() {
+            if line.ends_with("\tdevice") && !line.starts_with("List") {
+                return Some(line.split('\t').next()?.to_string());
+            }
+        }
+        None
     }
 
     /// Install an APK via ADB.

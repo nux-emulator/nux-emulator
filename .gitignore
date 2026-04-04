@@ -18,3 +18,4 @@ Cargo.lock
 # Environment
 .env
 *.log
+.opencode
