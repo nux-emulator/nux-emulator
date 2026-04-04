@@ -9,6 +9,7 @@
 //! - mouseMoveMap: mouse delta → touch drag (FPS aim/camera)
 
 pub mod engine;
+pub mod overlay;
 
 use serde::Deserialize;
 use std::collections::HashMap;

@@ -174,9 +174,60 @@ impl KeymapEngine {
         if keysym == self.switch_keysym {
             self.active = !self.active;
             if self.active {
-                log::info!("keymap: activated");
+                log::info!("keymap: === ACTIVATED (press ` to deactivate) ===");
+                for node in &self.config.key_map_nodes {
+                    match node {
+                        KeyMapNode::KMT_CLICK {
+                            key, comment, pos, ..
+                        } => {
+                            log::info!(
+                                "  [{}] {} → tap({:.0}%, {:.0}%)",
+                                key,
+                                comment,
+                                pos.x * 100.0,
+                                pos.y * 100.0
+                            );
+                        }
+                        KeyMapNode::KMT_CLICK_TWICE {
+                            key, comment, pos, ..
+                        } => {
+                            log::info!(
+                                "  [{}] {} → toggle({:.0}%, {:.0}%)",
+                                key,
+                                comment,
+                                pos.x * 100.0,
+                                pos.y * 100.0
+                            );
+                        }
+                        KeyMapNode::KMT_STEER_WHEEL {
+                            left_key,
+                            right_key,
+                            up_key,
+                            down_key,
+                            ..
+                        } => {
+                            log::info!(
+                                "  [{}/{}/{}/{}] Movement joystick",
+                                up_key,
+                                left_key,
+                                down_key,
+                                right_key
+                            );
+                        }
+                        KeyMapNode::KMT_DRAG { key, comment, .. } => {
+                            log::info!("  [{}] {} → drag", key, comment);
+                        }
+                        KeyMapNode::KMT_CLICK_MULTI { key, comment, .. } => {
+                            log::info!("  [{}] {} → multi-tap", key, comment);
+                        }
+                    }
+                }
+                if self.config.mouse_move_map.is_some() {
+                    log::info!("  [Mouse] Camera/aim control");
+                }
+                log::info!("  [Mouse_Left] Fire");
             } else {
-                log::info!("keymap: deactivated");
+                log::info!("keymap: === DEACTIVATED ===");
                 self.release_all(control);
             }
             return true;

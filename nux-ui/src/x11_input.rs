@@ -589,7 +589,6 @@ fn run_input_loop(
                     }
 
                     if dragging {
-                        let (wx, wy) = xevent_xy(&event);
                         if let Some((ax, ay)) =
                             x11_to_android(wx, wy, win_w, win_h, fb_w, fb_h, landscape)
                         {
