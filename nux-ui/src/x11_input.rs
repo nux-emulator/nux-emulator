@@ -1,6 +1,9 @@
 //! X11 input bridge — captures mouse/keyboard events from the X11Presenter window
 //! and forwards them to Android via the scrcpy control socket.
+//! Integrates keymap engine for gaming keyboard+mouse → touch mapping.
 
+use crate::keymap;
+use crate::keymap::engine::KeymapEngine;
 use crate::scrcpy::control::ControlSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -220,17 +223,13 @@ fn x11_to_android(
     let ny = (wy - vp_y) as f64 / vp_h as f64;
 
     if landscape {
-        // Scrcpy touch packets include screen_width=720, screen_height=1280 (portrait).
-        // We must send portrait-space coordinates.
-        // Landscape VBO texcoord interpolation at screen (nx, ny):
-        //   u = 1 - ny,  v = nx
-        // Portrait pixel: px = u * fb_w = (1-ny) * 720, py = v * fb_h = nx * 1280
-        let ax = ((1.0 - ny) * fb_w as f64) as u32;
-        let ay = (nx * fb_h as f64) as u32;
-        log::debug!(
-            "x11-input: landscape wx={wx} wy={wy} nx={nx:.2} ny={ny:.2} → portrait ax={ax} ay={ay}"
-        );
-        Some((ax.min(fb_w as u32 - 1), ay.min(fb_h as u32 - 1)))
+        // ControlSocket now sends screen_width=1280, screen_height=720 in landscape.
+        // Map screen position directly to landscape display coordinates.
+        let disp_w = fb_h as f64; // 1280
+        let disp_h = fb_w as f64; // 720
+        let ax = (nx * disp_w) as u32;
+        let ay = (ny * disp_h) as u32;
+        Some((ax.min(fb_h as u32 - 1), ay.min(fb_w as u32 - 1)))
     } else {
         let ax = (nx * fb_w as f64) as u32;
         let ay = (ny * fb_h as f64) as u32;
@@ -432,6 +431,15 @@ fn run_input_loop(
     let mut landscape = false;
     let mut orient_check_counter = 0u32;
 
+    // Initialize keymap engine (if a keymap is available)
+    let mut keymap_engine: Option<KeymapEngine> = keymap::load_active_keymap().map(|config| {
+        log::info!(
+            "x11-input: keymap loaded ({} nodes)",
+            config.key_map_nodes.len()
+        );
+        KeymapEngine::new(config, fb_w as u32, fb_h as u32)
+    });
+
     log::info!("x11-input: event loop started");
 
     // Use poll to avoid busy-waiting
@@ -443,7 +451,24 @@ fn run_input_loop(
         if orient_check_counter % 10 == 0 {
             if let Ok(content) = std::fs::read_to_string("/tmp/nux-x11-orientation") {
                 let orient = content.trim().parse::<u8>().unwrap_or(0);
-                landscape = orient == 1 || orient == 3;
+                let new_landscape = orient == 1 || orient == 3;
+                if new_landscape != landscape {
+                    landscape = new_landscape;
+                    // Update scrcpy control socket orientation
+                    if let Ok(mut guard) = control.lock() {
+                        if let Some(cs) = guard.as_mut() {
+                            cs.set_orientation(landscape);
+                        }
+                    }
+                    // Update keymap display dimensions
+                    if let Some(ref mut km) = keymap_engine {
+                        if landscape {
+                            km.set_display_size(fb_h as u32, fb_w as u32);
+                        } else {
+                            km.set_display_size(fb_w as u32, fb_h as u32);
+                        }
+                    }
+                }
             }
         }
 
@@ -475,44 +500,17 @@ fn run_input_loop(
                 BUTTON_PRESS => {
                     let btn = xevent_button(&event);
                     let (wx, wy) = xevent_xy(&event);
+
+                    // Try keymap first
+                    if let Some(ref mut km) = keymap_engine {
+                        if km.on_mouse_down(btn, &control) {
+                            continue;
+                        }
+                    }
+
                     match btn {
                         BUTTON1 => {
-                            if landscape {
-                                // In landscape, use ADB input (scrcpy doesn't handle rotation well)
-                                let src_aspect = fb_h as f64 / fb_w as f64;
-                                let dst_aspect = win_w as f64 / win_h as f64;
-                                let (vp_x, vp_y, vp_w, vp_h) = if src_aspect > dst_aspect {
-                                    let vw = win_w;
-                                    let vh = (win_w as f64 / src_aspect) as i32;
-                                    (0, (win_h - vh) / 2, vw, vh)
-                                } else {
-                                    let vh = win_h;
-                                    let vw = (win_h as f64 * src_aspect) as i32;
-                                    ((win_w - vw) / 2, 0, vw, vh)
-                                };
-                                if wx >= vp_x && wx < vp_x + vp_w && wy >= vp_y && wy < vp_y + vp_h
-                                {
-                                    let nx = (wx - vp_x) as f64 / vp_w as f64;
-                                    let ny = (wy - vp_y) as f64 / vp_h as f64;
-                                    let tap_x = (nx * fb_h as f64).round() as u32;
-                                    let tap_y = (ny * fb_w as f64).round() as u32;
-                                    let tx = tap_x.to_string();
-                                    let ty = tap_y.to_string();
-                                    std::thread::spawn(move || {
-                                        let _ = std::process::Command::new("adb")
-                                            .args([
-                                                "-s",
-                                                "127.0.0.1:6520",
-                                                "shell",
-                                                "input",
-                                                "tap",
-                                                &tx,
-                                                &ty,
-                                            ])
-                                            .output();
-                                    });
-                                }
-                            } else if let Some((ax, ay)) =
+                            if let Some((ax, ay)) =
                                 x11_to_android(wx, wy, win_w, win_h, fb_w, fb_h, landscape)
                             {
                                 if let Ok(mut guard) = control.lock() {
@@ -552,6 +550,14 @@ fn run_input_loop(
                 }
                 BUTTON_RELEASE => {
                     let btn = xevent_button(&event);
+
+                    // Try keymap first
+                    if let Some(ref mut km) = keymap_engine {
+                        if km.on_mouse_up(btn, &control) {
+                            continue;
+                        }
+                    }
+
                     if btn == BUTTON1 && dragging {
                         let (wx, wy) = xevent_xy(&event);
                         let (ax, ay) = x11_to_android(wx, wy, win_w, win_h, fb_w, fb_h, landscape)
@@ -565,6 +571,23 @@ fn run_input_loop(
                     }
                 }
                 MOTION_NOTIFY => {
+                    let (wx, wy) = xevent_xy(&event);
+
+                    // In keymap mode, mouse motion → aim control (relative delta)
+                    if let Some(ref mut km) = keymap_engine {
+                        if km.active {
+                            // Compute delta from window center for relative mouse
+                            let cx = win_w / 2;
+                            let cy = win_h / 2;
+                            let dx = wx - cx;
+                            let dy = wy - cy;
+                            if dx != 0 || dy != 0 {
+                                km.on_mouse_move(dx, dy, &control);
+                            }
+                            continue;
+                        }
+                    }
+
                     if dragging {
                         let (wx, wy) = xevent_xy(&event);
                         if let Some((ax, ay)) =
@@ -581,6 +604,20 @@ fn run_input_loop(
                 KEY_PRESS | KEY_RELEASE => {
                     let keysym = unsafe { XLookupKeysym(&mut event, 0) };
                     let is_down = event.event_type() == KEY_PRESS;
+
+                    // Try keymap first
+                    if let Some(ref mut km) = keymap_engine {
+                        let consumed = if is_down {
+                            km.on_key_down(keysym, &control)
+                        } else {
+                            km.on_key_up(keysym, &control)
+                        };
+                        if consumed {
+                            continue;
+                        }
+                    }
+
+                    // Default keyboard handling
                     let state = xevent_state(&event);
                     let meta = x11_state_to_android_meta(state);
 

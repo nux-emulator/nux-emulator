@@ -24,11 +24,21 @@ const ACTION_MOVE: u8 = 2;
 const AKEY_ACTION_DOWN: u8 = 0;
 const AKEY_ACTION_UP: u8 = 1;
 
+/// Default pointer ID for single-touch (mouse).
+pub const POINTER_MOUSE: u64 = 0xFFFFFFFFFFFFFFFF;
+
 /// Persistent control connection to the scrcpy server.
 pub struct ControlSocket {
     stream: TcpStream,
+    /// Base screen dimensions (portrait: 720x1280).
+    base_width: u16,
+    base_height: u16,
+    /// Current screen dimensions sent in touch packets.
+    /// Swapped when landscape.
     screen_width: u16,
     screen_height: u16,
+    /// Whether the display is in landscape orientation.
+    landscape: bool,
     alive: bool,
 }
 
@@ -37,8 +47,11 @@ impl ControlSocket {
     pub fn new(stream: TcpStream, screen_width: u16, screen_height: u16) -> Self {
         Self {
             stream,
+            base_width: screen_width,
+            base_height: screen_height,
             screen_width,
             screen_height,
+            landscape: false,
             alive: true,
         }
     }
@@ -48,30 +61,72 @@ impl ControlSocket {
         self.alive
     }
 
-    /// Update screen dimensions (when video resolution changes).
+    /// Update base screen dimensions (when video resolution changes).
     pub fn set_screen_size(&mut self, width: u16, height: u16) {
-        self.screen_width = width;
-        self.screen_height = height;
+        self.base_width = width;
+        self.base_height = height;
+        self.update_orientation(self.landscape);
+    }
+
+    /// Set display orientation. Swaps screen dimensions for touch packets.
+    pub fn set_orientation(&mut self, landscape: bool) {
+        if self.landscape != landscape {
+            self.update_orientation(landscape);
+            log::info!(
+                "control: orientation → {} (screen {}x{})",
+                if landscape { "landscape" } else { "portrait" },
+                self.screen_width,
+                self.screen_height
+            );
+        }
+    }
+
+    /// Whether the display is currently in landscape mode.
+    pub fn is_landscape(&self) -> bool {
+        self.landscape
+    }
+
+    /// Current screen width (orientation-aware).
+    pub fn current_width(&self) -> u16 {
+        self.screen_width
+    }
+
+    /// Current screen height (orientation-aware).
+    pub fn current_height(&self) -> u16 {
+        self.screen_height
+    }
+
+    fn update_orientation(&mut self, landscape: bool) {
+        self.landscape = landscape;
+        if landscape {
+            // Landscape: swap dimensions (720x1280 → 1280x720)
+            self.screen_width = self.base_width.max(self.base_height);
+            self.screen_height = self.base_width.min(self.base_height);
+        } else {
+            // Portrait: normal dimensions (720x1280)
+            self.screen_width = self.base_width.min(self.base_height);
+            self.screen_height = self.base_width.max(self.base_height);
+        }
     }
 
     /// Send a tap (touch down + up) at the given coordinates.
     pub fn tap(&mut self, x: u32, y: u32) {
-        log::info!(
-            "control: tap({x}, {y}) screen={}x{}",
-            self.screen_width,
-            self.screen_height
-        );
-        self.touch(ACTION_DOWN, x, y, 0xFFFF);
-        self.touch(ACTION_UP, x, y, 0);
+        self.touch_id(ACTION_DOWN, POINTER_MOUSE, x, y, 0xFFFF);
+        self.touch_id(ACTION_UP, POINTER_MOUSE, x, y, 0);
     }
 
-    /// Send a touch event.
+    /// Send a touch event with the default pointer ID (mouse).
     pub fn touch(&mut self, action: u8, x: u32, y: u32, pressure: u16) {
+        self.touch_id(action, POINTER_MOUSE, x, y, pressure);
+    }
+
+    /// Send a touch event with a specific pointer ID (for multi-touch).
+    pub fn touch_id(&mut self, action: u8, pointer_id: u64, x: u32, y: u32, pressure: u16) {
         let mut buf = [0u8; 32];
         buf[0] = TYPE_INJECT_TOUCH;
         buf[1] = action;
-        // pointerId (8 bytes) — use -1 (0xFFFFFFFFFFFFFFFF) for mouse
-        buf[2..10].copy_from_slice(&0xFFFFFFFFFFFFFFFFu64.to_be_bytes());
+        // pointerId (8 bytes)
+        buf[2..10].copy_from_slice(&pointer_id.to_be_bytes());
         // position x, y (4 bytes each, signed i32)
         buf[10..14].copy_from_slice(&(x as i32).to_be_bytes());
         buf[14..18].copy_from_slice(&(y as i32).to_be_bytes());
@@ -92,19 +147,34 @@ impl ControlSocket {
         }
     }
 
-    /// Send touch down.
+    /// Send touch down with default pointer.
     pub fn touch_down(&mut self, x: u32, y: u32) {
         self.touch(ACTION_DOWN, x, y, 0xFFFF);
     }
 
-    /// Send touch move.
+    /// Send touch move with default pointer.
     pub fn touch_move(&mut self, x: u32, y: u32) {
         self.touch(ACTION_MOVE, x, y, 0xFFFF);
     }
 
-    /// Send touch up.
+    /// Send touch up with default pointer.
     pub fn touch_up(&mut self, x: u32, y: u32) {
         self.touch(ACTION_UP, x, y, 0);
+    }
+
+    /// Send touch down with specific pointer ID.
+    pub fn touch_down_id(&mut self, pointer_id: u64, x: u32, y: u32) {
+        self.touch_id(ACTION_DOWN, pointer_id, x, y, 0xFFFF);
+    }
+
+    /// Send touch move with specific pointer ID.
+    pub fn touch_move_id(&mut self, pointer_id: u64, x: u32, y: u32) {
+        self.touch_id(ACTION_MOVE, pointer_id, x, y, 0xFFFF);
+    }
+
+    /// Send touch up with specific pointer ID.
+    pub fn touch_up_id(&mut self, pointer_id: u64, x: u32, y: u32) {
+        self.touch_id(ACTION_UP, pointer_id, x, y, 0);
     }
 
     /// Send a key event (down + up).

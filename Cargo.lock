@@ -1140,6 +1140,8 @@ dependencies = [
  "log",
  "nix",
  "nux-core",
+ "serde",
+ "serde_json",
  "wayland-backend",
  "wayland-protocols",
  "wayland-scanner",
