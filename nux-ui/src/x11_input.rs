@@ -604,7 +604,42 @@ fn run_input_loop(
                     let keysym = unsafe { XLookupKeysym(&mut event, 0) };
                     let is_down = event.event_type() == KEY_PRESS;
 
-                    // Try keymap first
+                    // Navigation keys — always active, even in fullscreen games.
+                    // These bypass keymap so the user can always exit games.
+                    if is_down {
+                        match keysym {
+                            0xff1b => {
+                                // Escape → Android Back
+                                if let Ok(mut g) = control.lock() {
+                                    if let Some(cs) = g.as_mut() {
+                                        cs.back();
+                                    }
+                                }
+                                continue;
+                            }
+                            0xffc8 => {
+                                // F11 → Android Home
+                                if let Ok(mut g) = control.lock() {
+                                    if let Some(cs) = g.as_mut() {
+                                        cs.key(crate::scrcpy::control::KEYCODE_HOME);
+                                    }
+                                }
+                                continue;
+                            }
+                            0xffc9 => {
+                                // F12 → Android Recent Apps
+                                if let Ok(mut g) = control.lock() {
+                                    if let Some(cs) = g.as_mut() {
+                                        cs.key(crate::scrcpy::control::KEYCODE_APP_SWITCH);
+                                    }
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Try keymap next
                     if let Some(ref mut km) = keymap_engine {
                         let consumed = if is_down {
                             km.on_key_down(keysym, &control)

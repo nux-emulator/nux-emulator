@@ -245,13 +245,27 @@ impl VmLauncher {
             .args([
                 "rm",
                 "-rf",
-                &format!("{}/cuttlefish", self.config.home_dir.display()),
                 "/tmp/cf_avd_0",
                 "/tmp/cf_env_0",
                 "/tmp/nux-x11-ready",
                 "/tmp/nux-x11-orientation",
             ])
             .output();
+
+        // Preserve the cuttlefish instance directory (contains persistent data image).
+        // Only clean runtime files, not disk images.
+        let instance_dir = self.config.home_dir.join("cuttlefish/instances/cvd-1");
+        if instance_dir.exists() {
+            // Clean runtime sockets/locks but keep disk images
+            let _ = Command::new("sudo")
+                .args([
+                    "rm",
+                    "-rf",
+                    &format!("{}/internal", instance_dir.display()),
+                    &format!("{}/logs", instance_dir.display()),
+                ])
+                .output();
+        }
         std::fs::create_dir_all(&self.config.home_dir).ok();
 
         // Run pre-launch hook (bind Wayland compositor here)
@@ -265,28 +279,36 @@ impl VmLauncher {
         let launch_cvd = host_out.join("bin/launch_cvd");
 
         let mut cmd = Command::new("sudo");
-        cmd.arg("-E")
-            .arg(&launch_cvd)
-            .args([
-                "--daemon=false",
-                &format!("--gpu_mode={}", self.config.gpu_mode),
-                &format!("--cpus={}", self.config.cpus),
-                &format!("--memory_mb={}", self.config.memory_mb),
-                "--report_anonymous_usage_stats=n",
-                "--enable_sandbox=false",
-                "--netsim=false",
-                "--enable_gpu_udmabuf=true",
-                "--blank_data_image_mb=16384",
-            ])
-            .env(
-                "DISPLAY",
-                std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
-            )
-            .env("HOME", &self.config.home_dir)
-            .env("ANDROID_PRODUCT_OUT", &product_out)
-            .env("ANDROID_HOST_OUT", &host_out)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        cmd.arg("-E").arg(&launch_cvd).args([
+            "--daemon=false",
+            &format!("--gpu_mode={}", self.config.gpu_mode),
+            &format!("--cpus={}", self.config.cpus),
+            &format!("--memory_mb={}", self.config.memory_mb),
+            "--report_anonymous_usage_stats=n",
+            "--enable_sandbox=false",
+            "--netsim=false",
+            "--enable_gpu_udmabuf=true",
+        ]);
+
+        // Only create a blank data image on first run (no existing instance).
+        // On subsequent runs, launch_cvd reuses the existing data partition,
+        // preserving installed apps and game progress.
+        let instance_dir = self.config.home_dir.join("cuttlefish/instances/cvd-1");
+        if !instance_dir.join("overlay.img").exists() {
+            log::info!("vm: first run — creating 64GB data partition");
+            cmd.arg("--blank_data_image_mb=65536");
+        } else {
+            log::info!("vm: reusing existing data partition (persistent storage)");
+        }
+        cmd.env(
+            "DISPLAY",
+            std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
+        )
+        .env("HOME", &self.config.home_dir)
+        .env("ANDROID_PRODUCT_OUT", &product_out)
+        .env("ANDROID_HOST_OUT", &host_out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
         // Add GPU-specific env vars
         for (key, val) in Self::gpu_env() {
