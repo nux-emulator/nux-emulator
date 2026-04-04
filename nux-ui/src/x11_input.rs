@@ -104,7 +104,6 @@ unsafe extern "C" {
     fn XCloseDisplay(display: Display) -> i32;
     fn XLookupKeysym(event: *mut XEvent, index: i32) -> KeySym;
     fn XConnectionNumber(display: Display) -> i32;
-    fn XUnmapWindow(display: Display, window: Window) -> i32;
     fn XCreateWindow(
         display: Display,
         parent: Window,

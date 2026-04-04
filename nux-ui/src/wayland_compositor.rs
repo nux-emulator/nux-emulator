@@ -5,6 +5,8 @@
 //! Input events are queued from the GTK4 thread and dispatched on the
 //! compositor thread (Wayland resources are not thread-safe).
 
+#![allow(dead_code)]
+
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, mpsc};

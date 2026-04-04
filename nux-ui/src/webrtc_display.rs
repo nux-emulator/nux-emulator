@@ -3,6 +3,8 @@
 //! Connects to the Cuttlefish WebRTC signaling server (port 8443),
 //! negotiates a WebRTC session, and renders the video stream via
 //! GStreamer: `webrtcbin → rtpvp9depay → vp9dec → videoconvert → appsink`.
+
+#![allow(dead_code)]
 //!
 //! Cuttlefish signaling protocol (polling mode):
 //!   1. POST /connect       {device_id}              → {connection_id}
