@@ -9,7 +9,6 @@ mod toolbar;
 pub mod vm_launcher;
 mod wayland_compositor;
 mod wayland_protocol;
-mod webrtc_display;
 mod window;
 mod x11_input;
 
