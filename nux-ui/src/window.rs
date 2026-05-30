@@ -347,89 +347,16 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
 
             let launcher = nux.state.launcher.clone();
             let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-            let (wl_tx, wl_rx) = std::sync::mpsc::channel::<(
-                std::sync::Arc<crate::wayland_compositor::FrameSlot>,
-                crate::wayland_compositor::WaylandInput,
-            )>();
 
+            // QEMU launches with its own GTK display window
             std::thread::spawn(move || {
-                let needs_bootstrap = launcher.needs_bootstrap();
-
-                if needs_bootstrap {
-                    // First run: launch_cvd creates its own Wayland socket.
-                    // We start launch_cvd, wait for crosvm, then swap the socket.
-                    let frames_sock = "/tmp/cf_avd_0/cvd-1/internal/frames.sock";
-                    let result = launcher.start_kernel("");
-
-                    if result.is_ok() {
-                        // Wait for crosvm to appear (up to 60s)
-                        let mut found = false;
-                        for _ in 0..600 {
-                            let out = std::process::Command::new("pgrep")
-                                .args(["-f", "crosvm.*crosvm_control"])
-                                .output();
-                            if let Ok(o) = out {
-                                if o.status.success() && !o.stdout.is_empty() {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-
-                        if found {
-                            log::info!("vm: crosvm detected, swapping Wayland socket");
-                            let _ = std::process::Command::new("sudo")
-                                .args(["chmod", "777", "/tmp/cf_avd_0/cvd-1/internal"])
-                                .output();
-                            let _ = std::fs::remove_file(frames_sock);
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-
-                            match crate::wayland_compositor::start_compositor_at_path(frames_sock) {
-                                Ok((frame_rx, wayland_input)) => {
-                                    log::info!("vm: Wayland compositor bound at {frames_sock}");
-                                    let _ = wl_tx.send((frame_rx, wayland_input));
-                                }
-                                Err(e) => {
-                                    log::error!("vm: Wayland compositor failed: {e}");
-                                }
-                            }
-                        } else {
-                            log::error!("vm: crosvm not detected after 60s");
-                        }
-                    }
-                    let _ = tx.send(result);
-                } else {
-                    // Subsequent runs: start our compositor first, pass socket to crosvm.
-                    let wayland_sock = "/tmp/nux-wayland.sock";
-                    let _ = std::fs::remove_file(wayland_sock);
-
-                    match crate::wayland_compositor::start_compositor_at_path(wayland_sock) {
-                        Ok((frame_slot, wayland_input)) => {
-                            log::info!("vm: Wayland compositor bound at {wayland_sock}");
-                            let _ = wl_tx.send((frame_slot, wayland_input));
-                        }
-                        Err(e) => {
-                            log::error!("vm: Wayland compositor failed: {e}");
-                            let _ = tx.send(Err(format!("Wayland compositor failed: {e}")));
-                            return;
-                        }
-                    }
-
-                    let result = launcher.start_kernel(wayland_sock);
-                    let _ = tx.send(result);
-                }
+                let result = launcher.start_kernel();
+                let _ = tx.send(result);
             });
 
             // Poll for result on UI thread
             let nux_clone = nux.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-                // Check if Wayland compositor is ready
-                if let Ok((frame_slot, wayland_input)) = wl_rx.try_recv() {
-                    *nux_clone.state.wayland_frame_slot.borrow_mut() = Some(frame_slot);
-                    *nux_clone.state.wayland_input.borrow_mut() = Some(wayland_input);
-                }
-
                 match rx.try_recv() {
                     Ok(Ok(())) => {
                         nux_clone.state.vm_running.set(true);
@@ -474,12 +401,6 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             nux.state.vm_running.set(false);
             nux.state.vm_booted.set(false);
             set_status(&nux.header_bar, "Stopped");
-            // Stop scrcpy display
-            if let Some(handle) = nux.state.scrcpy.borrow().as_ref() {
-                display::stop_scrcpy(&nux.display_widget, handle);
-            }
-            *nux.state.scrcpy.borrow_mut() = None;
-            display::show_stopped(&nux.display_widget);
             set_vm_action_sensitivity(&nux, false);
             nux.toast_overlay.add_toast(adw::Toast::new("VM stopped"));
         }
@@ -722,36 +643,11 @@ fn start_boot_monitor(nux: &Rc<NuxWindow>) {
                         .toast_overlay
                         .add_toast(adw::Toast::new("Android booted!"));
 
-                    // ARM translation must complete before scrcpy starts,
-                    // because zygote restart kills the scrcpy server.
-                    // WiFi is handled by init.nux.rc (boot_completed trigger).
-                    let (arm_tx, arm_rx) = std::sync::mpsc::channel::<()>();
-                    {
-                        let launcher2 = launcher.clone();
-                        std::thread::spawn(move || {
-                            let _ = launcher2.enable_wifi();
-                            let _ = launcher2.setup_arm_translation();
-                            let _ = arm_tx.send(());
-                        });
-                    }
-
-                    // Poll for ARM setup completion, then start scrcpy
-                    let nux2 = nux_clone.clone();
-                    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-                        match arm_rx.try_recv() {
-                            Ok(()) => {
-                                let dh = display::start_input_only(&nux2.input_area);
-                                *nux2.state.scrcpy.borrow_mut() = Some(dh);
-                                glib::ControlFlow::Break
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                glib::ControlFlow::Continue
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                log::error!("ARM setup thread died");
-                                glib::ControlFlow::Break
-                            }
-                        }
+                    // WiFi + ARM translation in background
+                    let launcher2 = launcher.clone();
+                    std::thread::spawn(move || {
+                        let _ = launcher2.enable_wifi();
+                        let _ = launcher2.setup_arm_translation();
                     });
                 }
                 glib::ControlFlow::Continue
