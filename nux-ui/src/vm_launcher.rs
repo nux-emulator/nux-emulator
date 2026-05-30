@@ -1,8 +1,6 @@
 //! VM launcher — manages the crosvm process lifecycle.
 //!
-//! Supports two modes:
-//! - `start()`: Uses `launch_cvd` (full Cuttlefish stack, scrcpy display)
-//! - `start_direct()`: Runs crosvm directly (native Wayland display, 60fps)
+//! Launches crosvm with direct kernel boot (no Cuttlefish launch_cvd).
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 use std::path::PathBuf;
@@ -21,12 +19,9 @@ pub struct VmLaunchConfig {
 
 impl Default for VmLaunchConfig {
     fn default() -> Self {
-        // Persistent HOME — survives restarts, preserves data partition
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let persistent_home = PathBuf::from(&home).join(".local/share/nux-emulator");
         Self {
             aosp_root: PathBuf::from("/build2/nux-emulator/nux-android-image/aosp"),
-            home_dir: persistent_home,
+            home_dir: crate::vm_bootstrap::data_dir(),
             gpu_mode: "gfxstream".to_owned(),
             cpus: 8,
             memory_mb: 8192,
@@ -34,7 +29,7 @@ impl Default for VmLaunchConfig {
     }
 }
 
-/// Manages the crosvm VM lifecycle via `launch_cvd`.
+/// Manages the crosvm VM lifecycle.
 #[derive(Debug)]
 pub struct VmLauncher {
     pub config: VmLaunchConfig,
@@ -71,7 +66,185 @@ impl VmLauncher {
         self.process.clone()
     }
 
-    /// Configuration for launching the VM.
+    /// Start the VM with direct kernel boot.
+    ///
+    /// `wayland_sock` is the path to the Wayland compositor socket (created before calling this).
+    pub fn start_kernel(&self, wayland_sock: &str) -> Result<(), String> {
+        if self.is_running() {
+            return Err("VM is already running".to_owned());
+        }
+
+        // Bootstrap disk images if needed
+        if !crate::vm_bootstrap::is_bootstrapped() {
+            log::info!("vm: first run — bootstrapping disk images...");
+            crate::vm_bootstrap::bootstrap()?;
+        }
+
+        // Kill any previous crosvm instances
+        let _ = Command::new("sudo")
+            .args(["pkill", "-9", "-f", "crosvm"])
+            .output();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Clean signal files
+        let _ = std::fs::remove_file("/tmp/nux-x11-ready");
+        let _ = std::fs::remove_file("/tmp/nux-x11-orientation");
+
+        // Setup networking
+        self.setup_networking().ok();
+
+        let product_out = crate::vm_bootstrap::product_out();
+        let data_dir = crate::vm_bootstrap::data_dir();
+        let host_out = crate::vm_bootstrap::host_out();
+        let crosvm_bin = host_out.join("bin/crosvm");
+
+        // Verify kernel exists
+        let kernel = product_out.join("kernel");
+        if !kernel.exists() {
+            return Err(format!("Kernel not found: {}", kernel.display()));
+        }
+
+        // Create log files
+        let crosvm_log = data_dir.join("crosvm.log");
+        let crosvm_err = data_dir.join("crosvm_err.log");
+        let kernel_log = data_dir.join("kernel.log");
+        for f in [&crosvm_log, &crosvm_err, &kernel_log] {
+            let _ = std::fs::File::create(f);
+        }
+
+        // Remove stale control socket
+        let control_sock = data_dir.join("crosvm_control.sock");
+        let _ = std::fs::remove_file(&control_sock);
+
+        // Build crosvm command
+        let mut cmd = Command::new("sudo");
+        cmd.arg("-E").arg(&crosvm_bin);
+        cmd.arg("run");
+
+        // Core settings
+        cmd.args(["--no-smt", "--no-usb", "--core-scheduling=false"]);
+        cmd.arg(format!("--mem={}", self.config.memory_mb));
+        cmd.arg(format!("--cpus={}", self.config.cpus));
+        cmd.arg("--disable-sandbox");
+
+        // Kernel + initrd
+        cmd.arg("--kernel").arg(&kernel);
+        cmd.arg("--initrd").arg(product_out.join("ramdisk.img"));
+
+        // Kernel command line
+        cmd.arg("--params").arg(
+            "androidboot.hardware=cutf_cvm \
+             androidboot.fstab_suffix=cf.f2fs.hctr2 \
+             androidboot.boot_devices=4010000000.pci \
+             androidboot.verifiedbootstate=orange \
+             androidboot.slot_suffix=_a \
+             console=hvc0 panic=-1 noefi loglevel=4 \
+             printk.devkmsg=on \
+             firmware_class.path=/vendor/etc/ \
+             init=/init",
+        );
+
+        // Block devices
+        cmd.arg(format!("--block=path={},ro", product_out.join("super.img").display()));
+        cmd.arg(format!("--block=path={}", data_dir.join("userdata.img").display()));
+        cmd.arg(format!("--block=path={}", data_dir.join("metadata.img").display()));
+        cmd.arg(format!("--block=path={}", data_dir.join("misc.img").display()));
+        cmd.arg(format!("--block=path={}", data_dir.join("sdcard.img").display()));
+
+        // GPU + Wayland display
+        cmd.arg(
+            "--gpu=displays=[[mode=windowed[720,1280],dpi=[320,320],refresh-rate=60]],\
+             context-types=gfxstream-gles:gfxstream-vulkan:gfxstream-composer,\
+             egl=true,surfaceless=true,glx=false,gles=true,\
+             udmabuf=true,\
+             renderer-features=\"GlProgramBinaryLinkStatus:enabled\"",
+        );
+        cmd.arg(format!("--wayland-sock={wayland_sock}"));
+
+        // Network
+        cmd.arg("--net=tap-name=cvd-mtap-01,mac=00:1a:11:e0:cf:00");
+
+        // vsock
+        cmd.arg("--vsock=cid=3");
+
+        // Serial ports
+        cmd.arg(format!(
+            "--serial=hardware=virtio-console,num=1,type=file,path={},console=true",
+            kernel_log.display()
+        ));
+        cmd.arg(format!(
+            "--serial=hardware=serial,num=1,type=file,path={},earlycon=true",
+            kernel_log.display()
+        ));
+
+        // Control socket
+        cmd.arg(format!("--socket={}", control_sock.display()));
+
+        // Environment variables
+        for (key, val) in Self::gpu_env() {
+            cmd.env(&key, &val);
+        }
+        cmd.env(
+            "DISPLAY",
+            std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
+        );
+
+        // Redirect output to log files
+        let stdout_file = std::fs::File::create(&crosvm_log)
+            .map_err(|e| format!("create crosvm.log: {e}"))?;
+        let stderr_file = std::fs::File::create(&crosvm_err)
+            .map_err(|e| format!("create crosvm_err.log: {e}"))?;
+        cmd.stdout(stdout_file).stderr(stderr_file);
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to start crosvm: {e}"))?;
+
+        log::info!("vm: crosvm started (pid={})", child.id());
+        *self.process.lock().unwrap() = Some(child);
+
+        // Start adb_connector to bridge vsock to TCP port 6520
+        let adb_connector = host_out.join("bin/adb_connector");
+        let home_dir2 = self.config.home_dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            log::info!("vm: starting adb_connector (vsock:3:5555 → TCP 6520)...");
+            let child = Command::new("sudo")
+                .arg("-E")
+                .arg(&adb_connector)
+                .arg("--addresses=vsock:3:5555")
+                .arg("--adb_port=6520")
+                .env("HOME", &home_dir2)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match child {
+                Ok(_) => log::info!("vm: adb_connector started"),
+                Err(e) => log::error!("vm: adb_connector failed: {e}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Stop the VM gracefully, then force-kill if needed.
+    pub fn stop(&self) -> Result<(), String> {
+        let _ = self.adb_shell(&["sync"]);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        log::info!("vm: stopping crosvm...");
+        let _ = Command::new("sudo")
+            .args(["pkill", "-TERM", "-f", "crosvm"])
+            .output();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let _ = Command::new("sudo")
+            .args(["pkill", "-9", "-f", "crosvm"])
+            .output();
+        *self.process.lock().unwrap() = None;
+        log::info!("vm: stopped");
+        Ok(())
+    }
+
+    /// Set up TAP networking for the VM.
     pub fn setup_networking(&self) -> Result<(), String> {
         // Create TAP devices
         for tap in &["cvd-mtap-01", "cvd-etap-01", "cvd-wtap-01"] {
@@ -225,360 +398,7 @@ impl VmLauncher {
         env
     }
 
-    /// Start the VM via `launch_cvd`.
-    /// `pre_launch` runs after cleanup but before launch_cvd starts —
-    /// use this to bind the Wayland compositor socket.
-    pub fn start_with_hook<F: FnOnce()>(&self, pre_launch: F) -> Result<(), String> {
-        if self.is_running() {
-            return Err("VM is already running".to_owned());
-        }
-
-        // Clean previous instance
-        let _ = Command::new("sudo")
-            .args([
-                "pkill",
-                "-9",
-                "-f",
-                "launch_cvd|run_cvd|crosvm|process_restarter|secure_env",
-            ])
-            .output();
-        std::thread::sleep(std::time::Duration::from_secs(2));
-
-        let _ = Command::new("sudo")
-            .args([
-                "rm",
-                "-rf",
-                "/tmp/cf_avd_0",
-                "/tmp/cf_env_0",
-                "/tmp/nux-x11-ready",
-                "/tmp/nux-x11-orientation",
-            ])
-            .output();
-
-        // Persistent HOME — don't wipe cuttlefish directory.
-        std::fs::create_dir_all(&self.config.home_dir).ok();
-
-        // Run pre-launch hook (bind Wayland compositor here)
-        pre_launch();
-
-        // Setup networking
-        self.setup_networking().ok();
-
-        let product_out = self.config.aosp_root.join("out/target/product/vsoc_x86_64");
-        let host_out = self.config.aosp_root.join("out/host/linux-x86");
-        let launch_cvd = host_out.join("bin/launch_cvd");
-
-        let mut cmd = Command::new("sudo");
-        cmd.arg("-E").arg(&launch_cvd).args([
-            "--daemon=false",
-            &format!("--gpu_mode={}", self.config.gpu_mode),
-            &format!("--cpus={}", self.config.cpus),
-            &format!("--memory_mb={}", self.config.memory_mb),
-            "--report_anonymous_usage_stats=n",
-            "--enable_sandbox=false",
-            "--netsim=false",
-            "--enable_gpu_udmabuf=true",
-            "--resume=true",
-        ]);
-
-        // Persistent data: check if instance-local userdata.img exists.
-        // First run: force creation of instance-local userdata.img (65GB).
-        // Subsequent runs: reuse it as-is.
-        let instance_userdata = self
-            .config
-            .home_dir
-            .join("cuttlefish/instances/cvd-1/userdata.img");
-        if instance_userdata.exists() {
-            log::info!(
-                "vm: reusing persistent userdata.img ({})",
-                instance_userdata.display()
-            );
-            cmd.arg("--data_policy=use_existing");
-        } else {
-            log::info!("vm: first run — creating 65GB data partition");
-            cmd.args(["--data_policy=always_create", "--blank_data_image_mb=65536"]);
-        }
-        cmd.env(
-            "DISPLAY",
-            std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
-        )
-        .env("HOME", &self.config.home_dir)
-        .env("ANDROID_PRODUCT_OUT", &product_out)
-        .env("ANDROID_HOST_OUT", &host_out)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-        // Add GPU-specific env vars
-        for (key, val) in Self::gpu_env() {
-            cmd.env(&key, &val);
-        }
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to start launch_cvd: {e}"))?;
-
-        *self.process.lock().unwrap() = Some(child);
-        Ok(())
-    }
-
-    /// Start the VM via `launch_cvd` (no pre-launch hook).
-    pub fn start(&self) -> Result<(), String> {
-        self.start_with_hook(|| {})
-    }
-
-    /// Start the VM by running crosvm directly (bypasses launch_cvd).
-    /// Uses our Wayland compositor for native display at 60fps.
-    /// Requires disk images from a previous `launch_cvd` run.
-    pub fn start_direct(&self, wayland_sock: &str) -> Result<(), String> {
-        if self.is_running() {
-            return Err("VM is already running".to_owned());
-        }
-
-        // Kill any previous crosvm instances
-        let _ = Command::new("sudo")
-            .args(["pkill", "-9", "-f", "crosvm|process_restarter|secure_env"])
-            .output();
-        let _ = Command::new("pkill")
-            .args(["-9", "-f", "crosvm|process_restarter|secure_env"])
-            .output();
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        self.setup_networking().ok();
-
-        let instance_dir = self.config.home_dir.join("cuttlefish/instances/cvd-1");
-        let internal_dir = instance_dir.join("internal");
-        let host_out = self.config.aosp_root.join("out/host/linux-x86");
-        let crosvm_bin = host_out.join("bin/crosvm");
-
-        // Verify disk images exist
-        let overlay = instance_dir.join("overlay.img");
-        if !overlay.exists() {
-            return Err(format!(
-                "Disk images not found at {}. Run launch_cvd once first to create them.",
-                instance_dir.display()
-            ));
-        }
-
-        // Create internal directory and log files
-        let _ = Command::new("sudo")
-            .args(["mkdir", "-p", &internal_dir.to_string_lossy()])
-            .output();
-
-        // Serial ports — essential ones use files, HAL ports use sink
-        let kernel_log = internal_dir.join("kernel.log");
-        let logcat_log = internal_dir.join("logcat.log");
-        let crosvm_log = internal_dir.join("crosvm.log");
-        let crosvm_err = internal_dir.join("crosvm_err.log");
-
-        // Create log files
-        for f in [&kernel_log, &logcat_log, &crosvm_log, &crosvm_err] {
-            let _ = Command::new("sudo")
-                .args(["touch", &f.to_string_lossy()])
-                .output();
-            let _ = Command::new("sudo")
-                .args(["chmod", "666", &f.to_string_lossy()])
-                .output();
-        }
-
-        // Build crosvm command
-        let mut cmd = Command::new("sudo");
-        cmd.arg("-E").arg(&crosvm_bin);
-        cmd.args(["--extended-status", "run"]);
-
-        // Control socket — remove stale one
-        let control_sock = internal_dir.join("crosvm_control.sock");
-        let _ = Command::new("sudo")
-            .args(["rm", "-f", &control_sock.to_string_lossy()])
-            .output();
-        cmd.arg(format!("--socket={}", control_sock.display()));
-
-        // Core settings
-        cmd.args(["--no-smt", "--no-usb", "--core-scheduling=false"]);
-        cmd.arg(format!("--mem={}", self.config.memory_mb));
-        cmd.arg(format!("--cpus={}", self.config.cpus));
-        cmd.arg("--disable-sandbox");
-
-        // GPU + Wayland display (our compositor)
-        cmd.arg(format!("--wayland-sock={wayland_sock}"));
-        cmd.arg(
-            "--gpu=displays=[[mode=windowed[720,1280],dpi=[320,320],refresh-rate=60]],\
-             context-types=gfxstream-gles:gfxstream-vulkan:gfxstream-composer,\
-             pci-address=00:02.0,egl=true,surfaceless=true,glx=false,gles=true,\
-             udmabuf=true,\
-             renderer-features=\"GlProgramBinaryLinkStatus:enabled\"",
-        );
-
-        // Disk images
-        cmd.arg(format!(
-            "--block=path={}",
-            instance_dir.join("overlay.img").display()
-        ));
-        cmd.arg(format!(
-            "--block=path={}",
-            instance_dir.join("persistent_composite.img").display()
-        ));
-        cmd.arg(format!(
-            "--block=path={}",
-            instance_dir.join("sdcard.img").display()
-        ));
-
-        // BIOS
-        cmd.arg(format!(
-            "--bios={}",
-            host_out
-                .join("etc/bootloader_x86_64/bootloader.crosvm")
-                .display()
-        ));
-
-        // pflash + pmem
-        cmd.arg(format!(
-            "--pflash={}",
-            instance_dir.join("pflash.img").display()
-        ));
-        cmd.arg(format!(
-            "--pmem=path={}",
-            instance_dir.join("hwcomposer-pmem").display()
-        ));
-        cmd.arg(format!(
-            "--pmem=path={}",
-            instance_dir.join("access-kregistry").display()
-        ));
-        cmd.arg(format!(
-            "--pstore=path={},size=2097152",
-            instance_dir.join("pstore").display()
-        ));
-
-        // Network
-        cmd.arg("--net=tap-name=cvd-mtap-01,mac=00:1a:11:e0:cf:00,pci-address=00:01.1");
-        cmd.arg("--net=tap-name=cvd-etap-01,mac=00:1a:11:e1:cf:00,pci-address=00:01.2");
-
-        // vsock
-        cmd.arg("--vsock=cid=3");
-
-        // Serial ports
-        cmd.arg(format!(
-            "--serial=hardware=virtio-console,num=1,type=file,path={},console=true",
-            kernel_log.display()
-        ));
-        cmd.arg(format!(
-            "--serial=hardware=serial,num=1,type=file,path={},earlycon=true",
-            kernel_log.display()
-        ));
-        cmd.arg("--serial=hardware=virtio-console,num=2,type=sink");
-        cmd.arg(format!(
-            "--serial=hardware=virtio-console,num=3,type=file,path={}",
-            logcat_log.display()
-        ));
-
-        // HAL serial ports — all sinks (no HAL services running)
-        for num in 4..=17 {
-            cmd.arg(format!(
-                "--serial=hardware=virtio-console,num={num},type=sink"
-            ));
-        }
-
-        // GPU environment
-        for (key, val) in Self::gpu_env() {
-            cmd.env(&key, &val);
-        }
-        cmd.env(
-            "DISPLAY",
-            std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
-        );
-
-        // Redirect output to log files
-        let stdout_file = std::fs::File::create(&crosvm_log)
-            .or_else(|_| {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&crosvm_log)
-            })
-            .map_err(|e| format!("create crosvm.log: {e}"))?;
-        let stderr_file = std::fs::File::create(&crosvm_err)
-            .or_else(|_| {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&crosvm_err)
-            })
-            .map_err(|e| format!("create crosvm_err.log: {e}"))?;
-        cmd.stdout(stdout_file).stderr(stderr_file);
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to start crosvm: {e}"))?;
-
-        log::info!("vm: crosvm started directly (pid={})", child.id());
-
-        *self.process.lock().unwrap() = Some(child);
-
-        // Start adb_connector to bridge vsock to TCP port 6520.
-        // In launch_cvd mode this is done automatically; in direct mode we do it.
-        let adb_connector = host_out.join("bin/adb_connector");
-        let home_dir2 = self.config.home_dir.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            log::info!("vm: starting adb_connector (vsock:3:5555 → TCP 6520)...");
-            let child = Command::new("sudo")
-                .arg("-E")
-                .arg(&adb_connector)
-                .arg("--addresses=vsock:3:5555")
-                .arg("--adb_port=6520")
-                .env("HOME", &home_dir2)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            match child {
-                Ok(_) => log::info!("vm: adb_connector started"),
-                Err(e) => log::error!("vm: adb_connector failed: {e}"),
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Stop the VM gracefully, then force-kill if needed.
-    pub fn stop(&self) -> Result<(), String> {
-        // Step 1: Sync filesystem inside the guest
-        let _ = self.adb_shell(&["sync"]);
-        std::thread::sleep(std::time::Duration::from_secs(2));
-
-        // Step 2: Kill crosvm with SIGTERM (flushes QCOW2 write cache cleanly).
-        // Do NOT use stop_cvd — it invalidates disk state.
-        // Do NOT use adb reboot -p — process_restarter keeps crosvm alive.
-        log::info!("vm: sending SIGTERM to crosvm (flushes QCOW2)...");
-        let _ = Command::new("sudo")
-            .args(["pkill", "-TERM", "-f", "crosvm.*crosvm_control"])
-            .output();
-
-        // Wait for crosvm to exit (up to 15s)
-        for i in 0..30 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let out = Command::new("pgrep")
-                .args(["-f", "crosvm.*crosvm_control"])
-                .output();
-            if let Ok(o) = out {
-                if !o.status.success() || o.stdout.is_empty() {
-                    log::info!("vm: crosvm exited cleanly (took {}s)", (i + 1) / 2);
-                    break;
-                }
-            }
-        }
-
-        // Step 3: Kill remaining infrastructure
-        let _ = Command::new("sudo")
-            .args(["pkill", "-9", "-f",
-                "launch_cvd|run_cvd|process_restarter|secure_env|log_tee|netsimd|wmediumd|webrtc|webRTC|casimir|modem_sim"])
-            .output();
-
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        *self.process.lock().unwrap() = None;
-        log::info!("vm: shutdown complete");
-        Ok(())
-    }
-
-    /// Connect `WiFi` after boot.
+    /// Connect WiFi after boot.
     pub fn enable_wifi(&self) -> Result<(), String> {
         let _ = Command::new("adb")
             .args([
@@ -608,11 +428,6 @@ impl VmLauncher {
     }
 
     /// Set up ARM64 native bridge (binfmt_misc) after boot.
-    /// SELinux blocks the init.rc trigger, so we:
-    /// 1. Set SELinux permissive
-    /// 2. Set blocked properties
-    /// 3. Mount binfmt_misc and register entries
-    /// 4. Restart zygote so native bridge reinitializes
     pub fn setup_arm_translation(&self) -> Result<(), String> {
         let adb = |args: &[&str]| -> Result<std::process::Output, String> {
             Command::new("adb")
@@ -633,8 +448,7 @@ impl VmLauncher {
         let _ = adb(&["remount"]);
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        // Push ALL Google's ARM64 guest libs (build system installs AOSP-built ones
-        // which have different ABIs — berberis needs Google's matching versions)
+        // Push ALL Google's ARM64 guest libs
         let arm64_dir = prebuilts.join("lib64/arm64");
         if arm64_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&arm64_dir) {
@@ -683,7 +497,6 @@ impl VmLauncher {
         let _ = adb(&["shell", "su", "0", "setenforce", "0"]);
 
         // Regenerate linkerconfig with native bridge paths
-        // The runtime linkerconfig doesn't include arm64 paths for app namespaces
         let _ = adb(&["shell", "su", "0", "rm", "-rf", "/linkerconfig"]);
         let _ = adb(&[
             "shell",
@@ -737,15 +550,12 @@ impl VmLauncher {
     }
 
     /// Check if ADB is connected and boot is complete.
-    /// Tries TCP (127.0.0.1:6520) first, falls back to any connected device
-    /// (direct crosvm mode uses vsock which appears as USB device).
     pub fn check_boot_status(&self) -> BootStatus {
-        // Try TCP first (launch_cvd mode)
+        // Try TCP first
         let _ = Command::new("adb")
             .args(["connect", "127.0.0.1:6520"])
             .output();
 
-        // Find a working device serial
         let serial = self.find_adb_device();
         let serial = match serial {
             Some(s) => s,

@@ -358,7 +358,7 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
                 // Always use launch_cvd — it manages all services
                 // (adb_connector, process_monitor, etc.).
                 // Our patched assemble_cvd preserves disk images with --resume.
-                let result = launcher.start();
+                let result = launcher.start_kernel(frames_sock);
 
                 if result.is_ok() {
                     let mut found = false;
