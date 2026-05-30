@@ -353,52 +353,23 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             )>();
 
             std::thread::spawn(move || {
-                let frames_sock = "/tmp/cf_avd_0/cvd-1/internal/frames.sock";
+                let wayland_sock = "/tmp/nux-wayland.sock";
 
-                // Always use launch_cvd — it manages all services
-                // (adb_connector, process_monitor, etc.).
-                // Our patched assemble_cvd preserves disk images with --resume.
-                let result = launcher.start_kernel(frames_sock);
-
-                if result.is_ok() {
-                    let mut found = false;
-                    for _ in 0..600 {
-                        let out = std::process::Command::new("pgrep")
-                            .args(["-f", "crosvm.*crosvm_control"])
-                            .output();
-                        if let Ok(o) = out {
-                            if o.status.success() && !o.stdout.is_empty() {
-                                found = true;
-                                break;
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                // Start Wayland compositor BEFORE crosvm — crosvm connects on startup
+                match crate::wayland_compositor::start_compositor_at_path(wayland_sock) {
+                    Ok((frame_slot, wayland_input)) => {
+                        log::info!("vm: Wayland compositor bound at {wayland_sock}");
+                        let _ = wl_tx.send((frame_slot, wayland_input));
                     }
-
-                    if found {
-                        log::info!("vm: crosvm detected, swapping Wayland socket");
-
-                        let _ = std::process::Command::new("sudo")
-                            .args(["chmod", "777", "/tmp/cf_avd_0/cvd-1/internal"])
-                            .output();
-
-                        let _ = std::fs::remove_file(frames_sock);
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-
-                        match crate::wayland_compositor::start_compositor_at_path(frames_sock) {
-                            Ok((frame_rx, wayland_input)) => {
-                                log::info!("vm: Wayland compositor bound at {frames_sock}");
-                                let _ = wl_tx.send((frame_rx, wayland_input));
-                            }
-                            Err(e) => {
-                                log::error!("vm: Wayland compositor failed: {e}");
-                            }
-                        }
-                    } else {
-                        log::error!("vm: crosvm not detected after 60s");
+                    Err(e) => {
+                        log::error!("vm: Wayland compositor failed: {e}");
+                        let _ = tx.send(Err(format!("Wayland compositor failed: {e}")));
+                        return;
                     }
                 }
 
+                // Launch crosvm with direct kernel boot
+                let result = launcher.start_kernel(wayland_sock);
                 let _ = tx.send(result);
             });
 
