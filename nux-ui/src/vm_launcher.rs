@@ -127,8 +127,7 @@ impl VmLauncher {
         cmd.arg(format!("--cpus={}", self.config.cpus));
         cmd.arg("--disable-sandbox");
 
-        // Kernel + initrd
-        cmd.arg("--kernel").arg(&kernel);
+        // Kernel initrd and params
         cmd.arg("--initrd").arg(product_out.join("ramdisk.img"));
 
         // Kernel command line
@@ -188,6 +187,9 @@ impl VmLauncher {
             "DISPLAY",
             std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()),
         );
+
+        // Kernel binary (positional argument — must be last)
+        cmd.arg(&kernel);
 
         // Redirect output to log files
         let stdout_file = std::fs::File::create(&crosvm_log)
