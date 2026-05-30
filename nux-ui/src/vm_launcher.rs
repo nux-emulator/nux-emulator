@@ -153,7 +153,7 @@ impl VmLauncher {
 
         // Serial/console (hvc0 for kernel + Android console)
         cmd.args(["-device", "virtio-serial-pci"]);
-        cmd.args(["-chardev", "stdio,id=hvc0"]);
+        cmd.args(["-chardev", "file,id=hvc0,path=/tmp/nux-kernel.log"]);
         cmd.args(["-device", "virtconsole,chardev=hvc0"]);
 
         // Network (user-mode with ADB port forward)
@@ -166,9 +166,6 @@ impl VmLauncher {
         cmd.args([
             "-monitor", &format!("unix:{},server,nowait", monitor_sock.display()),
         ]);
-
-        // Serial
-        cmd.args(["-serial", "mon:stdio"]);
 
         // Environment
         cmd.env("DISPLAY", std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_owned()));
