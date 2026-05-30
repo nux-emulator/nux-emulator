@@ -104,15 +104,19 @@ impl VmLauncher {
         let userdata_img = data_dir.join("userdata.img");
         let cache_img = data_dir.join("cache.img");
 
-        let cmdline = "androidboot.hardware=ranchu \
-            androidboot.serialno=EMULATOR30X0X0X0 \
-            console=ttyS0 \
-            androidboot.console=ttyS0 \
+        let cmdline = "androidboot.hardware=cutf_cvm \
+            androidboot.fstab_suffix=cf.f2fs.hctr2 \
+            androidboot.serialno=CUTTLEFISHCVD01 \
+            androidboot.boot_devices=4010000000.pci \
             androidboot.verifiedbootstate=orange \
-            qemu=1 \
-            qemu.gles=1 \
-            androidboot.logcat=*:V \
-            clocksource=pit";
+            androidboot.slot_suffix=_a \
+            console=hvc0 \
+            panic=-1 \
+            noefi \
+            loglevel=4 \
+            printk.devkmsg=on \
+            firmware_class.path=/vendor/etc/ \
+            init=/init";
 
         let mut cmd = Command::new("qemu-system-x86_64");
         cmd.args(["-enable-kvm", "-cpu", "host"]);
@@ -146,6 +150,11 @@ impl VmLauncher {
         // Input
         cmd.args(["-device", "virtio-keyboard-pci"]);
         cmd.args(["-device", "virtio-mouse-pci"]);
+
+        // Serial/console (hvc0 for kernel + Android console)
+        cmd.args(["-device", "virtio-serial-pci"]);
+        cmd.args(["-chardev", "stdio,id=hvc0"]);
+        cmd.args(["-device", "virtconsole,chardev=hvc0"]);
 
         // Network (user-mode with ADB port forward)
         cmd.args([
