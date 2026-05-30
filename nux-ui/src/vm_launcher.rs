@@ -129,18 +129,14 @@ impl VmLauncher {
         cmd.args(["-initrd", &initrd.to_string_lossy()]);
         cmd.args(["-append", cmdline]);
 
-        // Drives
+        // Drives — single GPT disk with all partitions
+        let android_disk = data_dir.join("android_disk.img");
+        if !android_disk.exists() {
+            return Err("android_disk.img not found. Run scripts/build-android-disk.sh first.".into());
+        }
         cmd.args([
-            "-drive", &format!("file={},format=raw,if=none,id=system,readonly=on", super_img.display()),
-            "-device", "virtio-blk-pci,drive=system",
-        ]);
-        cmd.args([
-            "-drive", &format!("file={},format=raw,if=none,id=userdata", userdata_img.display()),
-            "-device", "virtio-blk-pci,drive=userdata",
-        ]);
-        cmd.args([
-            "-drive", &format!("file={},format=raw,if=none,id=cache", cache_img.display()),
-            "-device", "virtio-blk-pci,drive=cache",
+            "-drive", &format!("file={},format=raw,if=none,id=disk0", android_disk.display()),
+            "-device", "virtio-blk-pci,drive=disk0",
         ]);
 
         // GPU
