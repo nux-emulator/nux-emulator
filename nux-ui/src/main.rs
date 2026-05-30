@@ -11,6 +11,7 @@ pub mod vm_launcher;
 mod wayland_compositor;
 mod wayland_protocol;
 mod window;
+mod vm_bootstrap;
 mod x11_input;
 
 use adw::prelude::*;
