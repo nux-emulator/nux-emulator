@@ -128,7 +128,7 @@ impl VmLauncher {
         cmd.arg("--disable-sandbox");
 
         // Kernel initrd and params
-        cmd.arg("--initrd").arg(product_out.join("ramdisk.img"));
+        cmd.arg("--initrd").arg(data_dir.join("combined_ramdisk.img"));
 
         // Kernel command line
         cmd.arg("--params").arg(
