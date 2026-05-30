@@ -1,18 +1,13 @@
 //! nux-ui — GTK4 + libadwaita frontend for the Nux Android emulator.
 
-mod display;
 mod keymap;
 mod overlay;
-pub mod scrcpy;
 mod settings;
 mod state;
 mod toolbar;
 pub mod vm_launcher;
-mod wayland_compositor;
-mod wayland_protocol;
 mod window;
 mod vm_bootstrap;
-mod x11_input;
 
 use adw::prelude::*;
 use gtk::glib;

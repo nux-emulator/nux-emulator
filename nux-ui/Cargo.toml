@@ -8,12 +8,6 @@ license.workspace = true
 nux-core = { path = "../nux-core" }
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
-wayland-server = "0.31"
-wayland-backend = "0.3"
-wayland-protocols = { version = "0.32", features = ["server"] }
-wayland-scanner = "0.31"
-nix = { version = "0.29", features = ["fs"] }
-libc = "0.2"
 env_logger = "0.11"
 anyhow = { workspace = true }
 log = { workspace = true }

@@ -4,7 +4,7 @@
 //! mouse accumulator) and converts X11 input events into scrcpy touch commands.
 
 use crate::keymap::{self, KeyMapNode, KeymapConfig, MouseMoveMap, Pos};
-use crate::scrcpy::control::ControlSocket;
+use crate::keymap::control::ControlSocket;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 

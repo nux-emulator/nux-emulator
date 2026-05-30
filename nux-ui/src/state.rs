@@ -1,11 +1,9 @@
 //! Shared UI state for cross-widget communication.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::Arc;
 
-use crate::display::ScrcpyHandle;
 use crate::vm_launcher::{VmLaunchConfig, VmLauncher};
-use crate::wayland_compositor::{FrameSlot, WaylandInput};
 
 /// Lightweight shared state for the UI layer.
 #[derive(Debug)]
@@ -24,12 +22,6 @@ pub struct UiState {
     pub pre_fs_height: Cell<i32>,
     /// VM launcher instance.
     pub launcher: Arc<VmLauncher>,
-    /// Display handle (scrcpy control for input).
-    pub scrcpy: RefCell<Option<ScrcpyHandle>>,
-    /// Wayland frame slot (set before VM boot, consumed on boot).
-    pub wayland_frame_slot: RefCell<Option<Arc<FrameSlot>>>,
-    /// Wayland input handle for sending pointer/keyboard events to crosvm.
-    pub wayland_input: RefCell<Option<WaylandInput>>,
 }
 
 impl Default for UiState {
@@ -42,9 +34,6 @@ impl Default for UiState {
             pre_fs_width: Cell::new(1024),
             pre_fs_height: Cell::new(768),
             launcher: Arc::new(VmLauncher::new(VmLaunchConfig::default())),
-            scrcpy: RefCell::new(None),
-            wayland_frame_slot: RefCell::new(None),
-            wayland_input: RefCell::new(None),
         }
     }
 }

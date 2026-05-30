@@ -7,7 +7,6 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use crate::display;
 use crate::overlay;
 use crate::settings;
 use crate::state::UiState;
@@ -78,8 +77,12 @@ impl NuxWindow {
         header_bar.pack_end(&menu_button);
         header_bar.pack_end(&fps_label);
 
-        // ── Display area ─────────────────────────────────────────
-        let (display_widget, input_area) = display::build_display();
+        // ── Display area (placeholder — QEMU provides its own GTK window) ──
+        let input_area = gtk::DrawingArea::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        let display_widget = gtk::Overlay::builder().child(&input_area).build();
         let keymap_overlay_widget = overlay::build_keymap_overlay();
 
         // Add keymap overlay on top of the display

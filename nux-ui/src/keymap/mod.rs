@@ -8,6 +8,7 @@
 //! - KMT_DRAG: key → swipe from A to B
 //! - mouseMoveMap: mouse delta → touch drag (FPS aim/camera)
 
+pub mod control;
 pub mod engine;
 pub mod overlay;
 
