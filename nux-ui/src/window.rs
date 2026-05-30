@@ -353,24 +353,72 @@ fn register_window_actions(nux: &Rc<NuxWindow>) {
             )>();
 
             std::thread::spawn(move || {
-                let wayland_sock = "/tmp/nux-wayland.sock";
+                let needs_bootstrap = launcher.needs_bootstrap();
 
-                // Start Wayland compositor BEFORE crosvm — crosvm connects on startup
-                match crate::wayland_compositor::start_compositor_at_path(wayland_sock) {
-                    Ok((frame_slot, wayland_input)) => {
-                        log::info!("vm: Wayland compositor bound at {wayland_sock}");
-                        let _ = wl_tx.send((frame_slot, wayland_input));
+                if needs_bootstrap {
+                    // First run: launch_cvd creates its own Wayland socket.
+                    // We start launch_cvd, wait for crosvm, then swap the socket.
+                    let frames_sock = "/tmp/cf_avd_0/cvd-1/internal/frames.sock";
+                    let result = launcher.start_kernel("");
+
+                    if result.is_ok() {
+                        // Wait for crosvm to appear (up to 60s)
+                        let mut found = false;
+                        for _ in 0..600 {
+                            let out = std::process::Command::new("pgrep")
+                                .args(["-f", "crosvm.*crosvm_control"])
+                                .output();
+                            if let Ok(o) = out {
+                                if o.status.success() && !o.stdout.is_empty() {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+
+                        if found {
+                            log::info!("vm: crosvm detected, swapping Wayland socket");
+                            let _ = std::process::Command::new("sudo")
+                                .args(["chmod", "777", "/tmp/cf_avd_0/cvd-1/internal"])
+                                .output();
+                            let _ = std::fs::remove_file(frames_sock);
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+
+                            match crate::wayland_compositor::start_compositor_at_path(frames_sock) {
+                                Ok((frame_rx, wayland_input)) => {
+                                    log::info!("vm: Wayland compositor bound at {frames_sock}");
+                                    let _ = wl_tx.send((frame_rx, wayland_input));
+                                }
+                                Err(e) => {
+                                    log::error!("vm: Wayland compositor failed: {e}");
+                                }
+                            }
+                        } else {
+                            log::error!("vm: crosvm not detected after 60s");
+                        }
                     }
-                    Err(e) => {
-                        log::error!("vm: Wayland compositor failed: {e}");
-                        let _ = tx.send(Err(format!("Wayland compositor failed: {e}")));
-                        return;
+                    let _ = tx.send(result);
+                } else {
+                    // Subsequent runs: start our compositor first, pass socket to crosvm.
+                    let wayland_sock = "/tmp/nux-wayland.sock";
+                    let _ = std::fs::remove_file(wayland_sock);
+
+                    match crate::wayland_compositor::start_compositor_at_path(wayland_sock) {
+                        Ok((frame_slot, wayland_input)) => {
+                            log::info!("vm: Wayland compositor bound at {wayland_sock}");
+                            let _ = wl_tx.send((frame_slot, wayland_input));
+                        }
+                        Err(e) => {
+                            log::error!("vm: Wayland compositor failed: {e}");
+                            let _ = tx.send(Err(format!("Wayland compositor failed: {e}")));
+                            return;
+                        }
                     }
+
+                    let result = launcher.start_kernel(wayland_sock);
+                    let _ = tx.send(result);
                 }
-
-                // Launch crosvm with direct kernel boot
-                let result = launcher.start_kernel(wayland_sock);
-                let _ = tx.send(result);
             });
 
             // Poll for result on UI thread

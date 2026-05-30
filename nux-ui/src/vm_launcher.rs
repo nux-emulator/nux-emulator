@@ -70,7 +70,7 @@ impl VmLauncher {
     }
 
     /// Check if this is a first run (no instance exists yet).
-    fn needs_bootstrap(&self) -> bool {
+    pub fn needs_bootstrap(&self) -> bool {
         !self.config.home_dir
             .join("cuttlefish/instances/cvd-1/overlay.img")
             .exists()
