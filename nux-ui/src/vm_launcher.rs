@@ -107,7 +107,7 @@ impl VmLauncher {
         let cmdline = "androidboot.hardware=cutf_cvm \
             androidboot.fstab_suffix=cf.f2fs.hctr2 \
             androidboot.serialno=CUTTLEFISHCVD01 \
-            androidboot.boot_devices=4010000000.pci \
+            androidboot.boot_devices=pci0000:00 \
             androidboot.verifiedbootstate=orange \
             androidboot.slot_suffix=_a \
             console=hvc0 \
