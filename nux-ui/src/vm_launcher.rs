@@ -92,32 +92,29 @@ impl VmLauncher {
         self.setup_networking().ok();
 
         let data_dir = crate::vm_bootstrap::data_dir();
-        let product_out = crate::vm_bootstrap::product_out();
+        let sysimg = crate::vm_bootstrap::sysimg_dir();
+        let data_dir = crate::vm_bootstrap::data_dir();
         let monitor_sock = data_dir.join("qemu-monitor.sock");
 
         // Remove stale monitor socket
         let _ = std::fs::remove_file(&monitor_sock);
 
-        let kernel = product_out.join("kernel");
-        let initrd = data_dir.join("combined_ramdisk.img");
-        let super_img = product_out.join("super.img");
+        let kernel = sysimg.join("kernel-ranchu");
+        let ramdisk = sysimg.join("ramdisk.img");
+        let system_img = sysimg.join("system.img");
+        let vendor_img = sysimg.join("vendor.img");
         let userdata_img = data_dir.join("userdata.img");
         let cache_img = data_dir.join("cache.img");
 
-        let cmdline = "androidboot.hardware=cutf_cvm \
-            androidboot.fstab_suffix=cf.f2fs.hctr2 \
-            androidboot.serialno=CUTTLEFISHCVD01 \
-            androidboot.boot_devices=pci0000:00/0000:00:04.0 \
+        let cmdline = "qemu=1 \
+            androidboot.hardware=ranchu \
+            androidboot.serialno=EMULATOR35X0X0X0 \
+            console=ttyS0 \
+            androidboot.console=ttyS0 \
             androidboot.verifiedbootstate=orange \
-            androidboot.slot_suffix=_a \
-            androidboot.force_normal_boot=1 \
-            console=hvc0 \
-            panic=-1 \
-            noefi \
-            loglevel=7 \
-            printk.devkmsg=on \
-            firmware_class.path=/vendor/etc/ \
-            init=/init";
+            qemu.gles=1 \
+            clocksource=pit \
+            8250.nr_uarts=1";
 
         let mut cmd = Command::new("qemu-system-x86_64");
         cmd.args(["-enable-kvm", "-cpu", "host"]);
@@ -127,17 +124,25 @@ impl VmLauncher {
 
         // Kernel + initrd
         cmd.args(["-kernel", &kernel.to_string_lossy()]);
-        cmd.args(["-initrd", &initrd.to_string_lossy()]);
+        cmd.args(["-initrd", &ramdisk.to_string_lossy()]);
         cmd.args(["-append", cmdline]);
 
-        // Drives — single GPT disk with all partitions
-        let android_disk = data_dir.join("android_disk.img");
-        if !android_disk.exists() {
-            return Err("android_disk.img not found. Run scripts/build-android-disk.sh first.".into());
-        }
+        // Drives — system and vendor are read-only, userdata is persistent
         cmd.args([
-            "-drive", &format!("file={},format=raw,if=none,id=disk0", android_disk.display()),
-            "-device", "virtio-blk-pci,drive=disk0",
+            "-drive", &format!("file={},format=raw,if=none,id=system,readonly=on", system_img.display()),
+            "-device", "virtio-blk-pci,drive=system",
+        ]);
+        cmd.args([
+            "-drive", &format!("file={},format=raw,if=none,id=vendor,readonly=on", vendor_img.display()),
+            "-device", "virtio-blk-pci,drive=vendor",
+        ]);
+        cmd.args([
+            "-drive", &format!("file={},format=raw,if=none,id=userdata", userdata_img.display()),
+            "-device", "virtio-blk-pci,drive=userdata",
+        ]);
+        cmd.args([
+            "-drive", &format!("file={},format=raw,if=none,id=cache", cache_img.display()),
+            "-device", "virtio-blk-pci,drive=cache",
         ]);
 
         // GPU
@@ -148,10 +153,8 @@ impl VmLauncher {
         cmd.args(["-device", "virtio-keyboard-pci"]);
         cmd.args(["-device", "virtio-mouse-pci"]);
 
-        // Serial/console (hvc0 for kernel + Android console)
-        cmd.args(["-device", "virtio-serial-pci"]);
-        cmd.args(["-chardev", "file,id=hvc0,path=/tmp/nux-kernel.log"]);
-        cmd.args(["-device", "virtconsole,chardev=hvc0"]);
+        // Serial/console (ttyS0 for ranchu kernel)
+        cmd.args(["-serial", "file:/tmp/nux-kernel.log"]);
 
         // Network (user-mode with ADB port forward)
         cmd.args([
