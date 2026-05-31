@@ -110,6 +110,7 @@ impl VmLauncher {
             androidboot.boot_devices=pci0000:00/0000:00:04.0 \
             androidboot.verifiedbootstate=orange \
             androidboot.slot_suffix=_a \
+            androidboot.force_normal_boot=1 \
             console=hvc0 \
             panic=-1 \
             noefi \
